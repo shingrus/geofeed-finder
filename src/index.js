@@ -81,6 +81,11 @@ const params = yargs
             .nargs("q", 0)
             .describe("q", "Detect ARIN's sub allocations locally instead of downloading a dump file.")
 
+            .alias("m", "live-referrals")
+            .alias("live-referrals", "arin-live-referrals")
+            .nargs("m", 0)
+            .describe("m", "Enable additional live whois probes for included RIRs to discover referral whois/rwhois geofeed records (slow, network-heavy).")
+
             .alias("z", "include-zip")
             .nargs("z", 0)
             .describe("z", "Zip codes are deprecated in geofeed and by default are excluded from the output.")
@@ -118,6 +123,7 @@ const options = {
     daysWhoisSuballocationsCache: 30, // Cannot be less than 7
     compileSuballocationLocally: !!params.q,
     skipSuballocations: !!params.p,
+    arinLiveReferrals: !!params.m,
     geofeedCacheDays: parseInt(params.g),
     arinBulk: params.b,
     af: params.a.toString().split(",").map(i => parseInt(i)),
