@@ -86,6 +86,21 @@ const params = yargs
             .nargs("m", 0)
             .describe("m", "Enable additional live whois probes for included RIRs to discover referral whois/rwhois geofeed records (slow, network-heavy).")
 
+            .alias("j", "referral-concurrency")
+            .nargs("j", 1)
+            .default("j", 10)
+            .describe("j", "Maximum concurrent referral/live whois queries. Lower this on low-memory hosts.")
+
+            .alias("e", "referral-cache-max")
+            .nargs("e", 1)
+            .default("e", 2000)
+            .describe("e", "Maximum referral whois responses cached in memory (0 disables cache).")
+
+            .alias("y", "live-referral-max-probes")
+            .nargs("y", 1)
+            .default("y", 20000)
+            .describe("y", "Maximum live-referral probe candidates per run (0 means unlimited).")
+
             .alias("z", "include-zip")
             .nargs("z", 0)
             .describe("z", "Zip codes are deprecated in geofeed and by default are excluded from the output.")
@@ -124,6 +139,9 @@ const options = {
     compileSuballocationLocally: !!params.q,
     skipSuballocations: !!params.p,
     arinLiveReferrals: !!params.m,
+    referralConcurrency: parseInt(params.j),
+    referralCacheMax: parseInt(params.e),
+    liveReferralMaxProbes: parseInt(params.y),
     geofeedCacheDays: parseInt(params.g),
     arinBulk: params.b,
     af: params.a.toString().split(",").map(i => parseInt(i)),

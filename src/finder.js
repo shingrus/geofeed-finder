@@ -32,9 +32,11 @@ export default class Finder {
             downloadTimeout: 14,
             referralDepthLimit: 10,
             referralConcurrency: 10,
+            referralCacheMax: 2000,
             referralTimeout: 10,
             referralFailFast: false,
             arinLiveReferrals: false,
+            liveReferralMaxProbes: 20000,
             daysWhoisSuballocationsCache: 7, // Cannot be less than this
             skipSuballocations: false,
             compileSuballocationLocally: false
@@ -47,7 +49,7 @@ export default class Finder {
         this.cacheDir = this.params.cacheDir.split("/").filter(i => !!i).join("/") + "/";
         this.csvParser = new CsvParser();
         this.startTime = moment();
-        this.referralQueryCache = {};
+        this.referralQueryCache = new Map();
         this.discoveryStats = {
             bulkPairs: 0,
             referralPairs: 0,
@@ -989,10 +991,18 @@ export default class Finder {
                     return lpm.getMatch(candidate.inetnum, false).length === 0;
                 });
 
-                const toProbe = uncovered;
+                const maxProbes = Math.max(parseInt(this.params.liveReferralMaxProbes || 0), 0);
+                const sortedUncovered = [...uncovered]
+                    .sort((a, b) => (b?.lastUpdate?.valueOf?.() ?? 0) - (a?.lastUpdate?.valueOf?.() ?? 0));
+                const toProbe = maxProbes > 0
+                    ? sortedUncovered.slice(0, maxProbes)
+                    : sortedUncovered;
                 const out = [];
 
-                this._logReferral(`[referral][live] candidates=${candidates.length} uncovered=${uncovered.length} probing=${toProbe.length}`);
+                this._logReferral(`[referral][live] candidates=${candidates.length} uncovered=${uncovered.length} probing=${toProbe.length} max_probes=${maxProbes > 0 ? maxProbes : "unlimited"}`);
+                if (maxProbes > 0 && uncovered.length > maxProbes) {
+                    this._logReferral(`[referral][live] probe-limit applied skipped=${uncovered.length - maxProbes}`);
+                }
 
                 if (!toProbe.length) {
                     return [];
@@ -1133,10 +1143,25 @@ export default class Finder {
 
             const cacheKey = `${query}|${key}`;
             this._logReferral(`[referral] query="${query}" source="${key}" depth=${depth} action=query`);
-            this.referralQueryCache[cacheKey] ??= this._runReferralWhoisQuery(current, query);
+            const referralCacheMax = Math.max(parseInt(this.params.referralCacheMax || 0), 0);
+            let response;
+
+            if (referralCacheMax === 0) {
+                response = await this._runReferralWhoisQuery(current, query);
+            } else {
+                if (!this.referralQueryCache.has(cacheKey)) {
+                    this.referralQueryCache.set(cacheKey, this._runReferralWhoisQuery(current, query));
+
+                    while (this.referralQueryCache.size > referralCacheMax) {
+                        const oldestKey = this.referralQueryCache.keys().next().value;
+                        this.referralQueryCache.delete(oldestKey);
+                    }
+                }
+
+                response = await this.referralQueryCache.get(cacheKey);
+            }
 
             try {
-                const response = await this.referralQueryCache[cacheKey];
                 const extractedGeofeeds = this._extractGeofeedUrlsFromResponse(response);
                 out.push(...extractedGeofeeds);
                 if (extractedGeofeeds.length > 0) {
