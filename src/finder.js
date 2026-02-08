@@ -30,9 +30,7 @@ export default class Finder {
             output: "result.csv",
             test: null,
             downloadTimeout: 14,
-            referralDepthLimit: 10,
             referralConcurrency: 10,
-            referralCacheMax: 2000,
             referralTimeout: 10,
             referralFailFast: false,
             arinLiveReferrals: false,
@@ -49,13 +47,11 @@ export default class Finder {
         this.cacheDir = this.params.cacheDir.split("/").filter(i => !!i).join("/") + "/";
         this.csvParser = new CsvParser();
         this.startTime = moment();
-        this.referralQueryCache = new Map();
         this.discoveryStats = {
             bulkPairs: 0,
-            referralPairs: 0,
             livePairs: 0,
             bulkUniqueGeofeeds: 0,
-            referralLiveUniqueGeofeeds: 0,
+            liveUniqueGeofeeds: 0,
             totalUniqueGeofeeds: 0
         };
 
@@ -159,94 +155,6 @@ export default class Finder {
         return [inetnum];
     };
 
-    _toReferralProtocol = (protocol, port) => {
-        const proto = `${protocol ?? ""}`.trim().toLowerCase();
-
-        if (proto === "rwhois" || parseInt(port) === 4321) {
-            return "rwhois";
-        }
-
-        return "whois";
-    };
-
-    _buildReferralTarget = (protocol, host, port) => {
-        const cleanHost = `${host ?? ""}`.trim().replace(/[)\],;."'`]+$/g, "");
-        const cleanPort = parseInt(port);
-        const safePort = Number.isInteger(cleanPort) && cleanPort > 0 && cleanPort <= 65535
-            ? cleanPort
-            : (this._toReferralProtocol(protocol, cleanPort) === "rwhois" ? 4321 : 43);
-
-        if (!cleanHost) {
-            return null;
-        }
-
-        return {
-            protocol: this._toReferralProtocol(protocol, safePort),
-            host: cleanHost,
-            port: safePort
-        };
-    };
-
-    _parseReferralTargets = (text) => {
-        const out = [];
-        const value = `${text ?? ""}`;
-
-        const protocolMatches = value.matchAll(/\b(r?whois):\/\/([a-z0-9.-]+)(?::([0-9]{1,5}))?/gi);
-        for (let [, protocol, host, port] of protocolMatches) {
-            const target = this._buildReferralTarget(protocol, host, port);
-            if (target) {
-                out.push(target);
-            }
-        }
-
-        const referralLines = value
-            .split(/\r?\n/)
-            .filter(line => /referr|whois/i.test(line));
-
-        for (let line of referralLines) {
-            const hostPortMatches = line.matchAll(/\b((?:[a-z0-9.-]+\.[a-z]{2,}|(?:\d{1,3}\.){3}\d{1,3}))(?::([0-9]{1,5}))\b/gi);
-            for (let [, host, port] of hostPortMatches) {
-                const target = this._buildReferralTarget(null, host, port);
-                if (target) {
-                    out.push(target);
-                }
-            }
-        }
-
-        const index = {};
-        for (let target of out) {
-            index[`${target.host}:${target.port}`] = target;
-        }
-
-        return Object.values(index);
-    };
-
-    _getReferralTargetsFromObject = (object) => {
-        const likelyReferralValues = this._getObjectValuesByKeys(object, [
-            "referralserver",
-            "referral",
-            "refer",
-            "whoisserver",
-            "whois",
-            "remarks",
-            "comment",
-            "comments"
-        ])
-            .filter(value => /referr|rwhois|whois:\/\//i.test(value));
-
-        const out = [];
-        for (let value of likelyReferralValues) {
-            out.push(...this._parseReferralTargets(value));
-        }
-
-        const index = {};
-        for (let item of out) {
-            index[`${item.host}:${item.port}`] = item;
-        }
-
-        return Object.values(index);
-    };
-
     _normalizeArinNetRangeObject = (object = {}) => {
         const normalized = {...object};
         const netRange = this._getObjectValuesByKeys(object, ["NetRange", "netrange"])[0];
@@ -304,7 +212,7 @@ export default class Finder {
             return true;
         }
 
-        return this._getReferralTargetsFromObject(inetnum).length > 0;
+        return false;
     };
 
     getBlocks = () => {
@@ -320,13 +228,7 @@ export default class Finder {
             "geofeed",
             "Geofeed",
             "last-updated",
-            "last-modified",
-            "ReferralServer",
-            "referralserver",
-            "referral",
-            "refer",
-            "whoisserver",
-            "WhoisServer"
+            "last-modified"
         ];
 
         const arinTypes = [];
@@ -347,16 +249,12 @@ export default class Finder {
                     "CIDR",
                     "Comment",
                     "comments",
-                    "ReferralServer",
-                    "referralserver",
-                    "WhoisServer",
-                    "whoisserver",
                     "Updated"
                 ]
             )
                 .then(blocks => blocks.flat().map(this._normalizeArinNetRangeObject))
                 .catch(error => {
-                    this.logger.log(`Error: ARIN referral records (${error?.message ?? "Unknown error"})`);
+                    this.logger.log(`Error: ARIN bulk records (${error?.message ?? "Unknown error"})`);
                     return [];
                 })
             : Promise.resolve([]);
@@ -374,13 +272,13 @@ export default class Finder {
                 }),
             arinExtra
         ])
-            .then(([bulkBlocks, arinReferralBlocks]) => {
-                const out = [...bulkBlocks, ...arinReferralBlocks]
+            .then(([bulkBlocks, arinBlocks]) => {
+                const out = [...bulkBlocks, ...arinBlocks]
                     .filter(i => !!i.inetnum || !!i.inet6num);
 
                 const index = {};
                 for (let block of out) {
-                    const id = `${block.inetnum || block.inet6num}|${block.geofeed || ""}|${block.ReferralServer || block.referralserver || ""}`;
+                    const id = `${block.inetnum || block.inet6num}|${block.geofeed || ""}`;
                     index[id] = block;
                 }
 
@@ -697,22 +595,6 @@ export default class Finder {
         return [...new Set([...geofeedUrls, ...csvUrls, ...allUrls])];
     };
 
-    _getReferralQuery = (inetnum) => {
-        if (!inetnum) {
-            return "";
-        }
-
-        if (inetnum.includes("/")) {
-            return inetnum;
-        }
-
-        if (inetnum.includes("-")) {
-            return inetnum.split("-")[0].trim();
-        }
-
-        return inetnum;
-    };
-
     _logReferral = (message) => {
         if (this.params.silent) {
             return;
@@ -1017,16 +899,7 @@ export default class Finder {
 
                     try {
                         const response = await this._runReferralWhoisQuery(target, query);
-                        const directUrls = this._extractGeofeedUrlsFromResponse(response);
-                        const referrals = this._parseReferralTargets(response)
-                            .filter(referral => !(referral.host === target.host && referral.port === target.port));
-                        let referralUrls = [];
-
-                        for (let referral of referrals) {
-                            referralUrls.push(...(await this._resolveReferralGeofeedUrls(referral, query)));
-                        }
-
-                        const geofeeds = [...new Set([...directUrls, ...referralUrls])];
+                        const geofeeds = this._extractGeofeedUrlsFromResponse(response);
 
                         if (geofeeds.length > 0) {
                             this._logReferralExtractedGeofeeds({
@@ -1044,7 +917,7 @@ export default class Finder {
                                 });
                             }
                         } else {
-                            this._logReferral(`[referral][live] rir=${candidate.rir} query="${query}" inetnum="${candidate.inetnum}" source="${target.host}:${target.port}" geofeeds=none referrals=${referrals.length}`);
+                            this._logReferral(`[referral][live] rir=${candidate.rir} query="${query}" inetnum="${candidate.inetnum}" source="${target.host}:${target.port}" geofeeds=none`);
                         }
                     } catch (error) {
                         const message = `Error: live referral query rir=${candidate.rir} source=${target.host}:${target.port} query="${query}" (${error?.message ?? "Unknown error"})`;
@@ -1121,140 +994,6 @@ export default class Finder {
                 throw new Error(message);
             }
         }
-    };
-
-    _resolveReferralGeofeedUrls = async (target, query) => {
-        const queue = [{target, depth: 0}];
-        const visited = new Set();
-        const out = [];
-        const maxDepth = Math.max(parseInt(this.params.referralDepthLimit || 10), 1);
-
-        while (queue.length > 0 && visited.size < maxDepth) {
-            const next = queue.shift();
-            const depth = next.depth;
-            const current = next.target;
-            const key = `${current.host}:${current.port}`;
-
-            if (visited.has(key)) {
-                continue;
-            }
-
-            visited.add(key);
-
-            const cacheKey = `${query}|${key}`;
-            this._logReferral(`[referral] query="${query}" source="${key}" depth=${depth} action=query`);
-            const referralCacheMax = Math.max(parseInt(this.params.referralCacheMax || 0), 0);
-            let response;
-
-            if (referralCacheMax === 0) {
-                response = await this._runReferralWhoisQuery(current, query);
-            } else {
-                if (!this.referralQueryCache.has(cacheKey)) {
-                    this.referralQueryCache.set(cacheKey, this._runReferralWhoisQuery(current, query));
-
-                    while (this.referralQueryCache.size > referralCacheMax) {
-                        const oldestKey = this.referralQueryCache.keys().next().value;
-                        this.referralQueryCache.delete(oldestKey);
-                    }
-                }
-
-                response = await this.referralQueryCache.get(cacheKey);
-            }
-
-            try {
-                const extractedGeofeeds = this._extractGeofeedUrlsFromResponse(response);
-                out.push(...extractedGeofeeds);
-                if (extractedGeofeeds.length > 0) {
-                    this._logReferralExtractedGeofeeds({
-                        query,
-                        target: current,
-                        depth,
-                        geofeeds: extractedGeofeeds
-                    });
-                } else {
-                    this._logReferral(`[referral] query="${query}" source="${current.host}:${current.port}" depth=${depth} geofeeds=none`);
-                }
-
-                if (depth + 1 < maxDepth) {
-                    const referrals = this._parseReferralTargets(response);
-                    this._logReferral(`[referral] query="${query}" source="${current.host}:${current.port}" depth=${depth} referrals=${referrals.length}`);
-                    for (let referral of referrals) {
-                        const referralKey = `${referral.host}:${referral.port}`;
-                        if (!visited.has(referralKey)) {
-                            queue.push({target: referral, depth: depth + 1});
-                        }
-                    }
-                }
-            } catch (error) {
-                const message = `Error: referral lookup ${current.host}:${current.port} (${error?.message ?? "Unknown error"})`;
-                this._logReferral(message);
-
-                if (this.params.referralFailFast) {
-                    throw new Error(message);
-                }
-            }
-        }
-
-        return [...new Set(out)];
-    };
-
-    _getReferralGeofeedInetnumPairs = (objects = []) => {
-        const out = [];
-        const candidates = [];
-        const seen = new Set();
-
-        for (let object of objects ?? []) {
-            const targets = this._getReferralTargetsFromObject(object);
-
-            if (!targets.length) {
-                continue;
-            }
-
-            const inetnums = this._extractInetnums(object);
-            const lastUpdate = this._getLastUpdate(object);
-
-            for (let inetnum of inetnums) {
-                const query = this._getReferralQuery(inetnum);
-                if (!query) {
-                    continue;
-                }
-
-                for (let target of targets) {
-                    const id = `${inetnum}|${query}|${target.host}:${target.port}`;
-                    if (!seen.has(id)) {
-                        seen.add(id);
-                        candidates.push({inetnum, query, target, lastUpdate});
-                    }
-                }
-            }
-        }
-
-        if (!candidates.length) {
-            this._logReferral("[referral] candidates=0");
-            return Promise.resolve([]);
-        }
-
-        this._logReferral(`[referral] candidates=${candidates.length}`);
-
-        const concurrency = Math.max(parseInt(this.params.referralConcurrency || 10), 1);
-
-        return batchPromises(concurrency, candidates, ({inetnum, query, target, lastUpdate}) => {
-            return this._resolveReferralGeofeedUrls(target, query)
-                .then(geofeeds => {
-                    for (let geofeed of geofeeds) {
-                        out.push({inetnum, geofeed, lastUpdate});
-                    }
-                });
-        })
-            .then(() => out)
-            .catch(error => {
-                if (this.params.referralFailFast) {
-                    return Promise.reject(error);
-                }
-
-                this.logger.log(`Error: referral lookup interrupted (${error?.message ?? "Unknown error"})`);
-                return out;
-            });
     };
 
     translateObject = (object) => {
@@ -1343,22 +1082,17 @@ export default class Finder {
                 return this.getBlocks()
                     .then((objects = []) => {
                         const bulkPairs = objects.map(this.translateObject).flat();
-                        return Promise.all([
-                            this._getReferralGeofeedInetnumPairs(objects),
-                            this._getLiveReferralGeofeedPairs(bulkPairs)
-                        ])
-                            .then(([referralPairs, liveReferralPairs]) => {
-                                const referralAndLivePairs = [...referralPairs, ...liveReferralPairs];
+                        return this._getLiveReferralGeofeedPairs(bulkPairs)
+                            .then((liveReferralPairs) => {
                                 this.discoveryStats = {
                                     bulkPairs: bulkPairs.length,
-                                    referralPairs: referralPairs.length,
                                     livePairs: liveReferralPairs.length,
                                     bulkUniqueGeofeeds: this._countUniqueGeofeeds(bulkPairs),
-                                    referralLiveUniqueGeofeeds: this._countUniqueGeofeeds(referralAndLivePairs),
-                                    totalUniqueGeofeeds: this._countUniqueGeofeeds([...bulkPairs, ...referralAndLivePairs])
+                                    liveUniqueGeofeeds: this._countUniqueGeofeeds(liveReferralPairs),
+                                    totalUniqueGeofeeds: this._countUniqueGeofeeds([...bulkPairs, ...liveReferralPairs])
                                 };
 
-                                return [...bulkPairs, ...referralAndLivePairs];
+                                return [...bulkPairs, ...liveReferralPairs];
                             });
                     })
                     .then(this.getMostUpdatedInetnums);
@@ -1374,8 +1108,8 @@ export default class Finder {
             .then(data => {
                 this._persistCacheIndex();
                 if (!this.params.test && !this.params.silent) {
-                    console.log(`[stats] geofeeds_unique bulk=${this.discoveryStats.bulkUniqueGeofeeds} live_or_referral=${this.discoveryStats.referralLiveUniqueGeofeeds} total=${this.discoveryStats.totalUniqueGeofeeds}`);
-                    console.log(`[stats] geofeed_pairs bulk=${this.discoveryStats.bulkPairs} referral=${this.discoveryStats.referralPairs} live=${this.discoveryStats.livePairs}`);
+                    console.log(`[stats] geofeeds_unique bulk=${this.discoveryStats.bulkUniqueGeofeeds} live=${this.discoveryStats.liveUniqueGeofeeds} total=${this.discoveryStats.totalUniqueGeofeeds}`);
+                    console.log(`[stats] geofeed_pairs bulk=${this.discoveryStats.bulkPairs} live=${this.discoveryStats.livePairs}`);
                 }
                 if (this.params.disableProcessing) {
                     return [];
