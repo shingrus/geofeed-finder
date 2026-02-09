@@ -80,9 +80,8 @@ The application accepts the following parameters:
 | -d        | Download timeout. Interrupt downloading a geofeed file after seconds. Default: 10 seconds.                           |
 | -f        | Path to a file with additional geofeed URLs (one per line).                                                          |
 | -x        | Download geofeed files but skip processing and validation.                                                           |
-| -m        | Enable extra live whois/rwhois referral probes (slow, network-heavy).                                               |
-| -j        | Max concurrent referral/live whois queries. Default: 10.                                                             |
-| -e        | Max referral whois responses cached in memory. Default: 2000. Use 0 to disable cache.                              |
+| -m        | Enable extra live whois probes (slow, network-heavy).                                                               |
+| -j        | Max concurrent live whois queries. Default: 10.                                                                     |
 | -y        | Max live-referral probe candidates per run. Default: 20000. Use 0 for unlimited.                                   |
 | -p        | Do not fetch arin sub allocations. You will save considerable time but have a potentially partial output.            |
 | -q        | Detect ARIN's sub allocations locally instead of downloading a dump file.                                            |
@@ -135,8 +134,7 @@ const options = {
     test: "ip/prefix", // Test specific ip/prefix using RDAP
     output: "result.csv", // Output file (default: "result.csv")
     downloadTimeout: 5, // Interrupt downloading a geofeed file after seconds (default: 10)
-    referralConcurrency: 10, // Max concurrent referral/live whois queries (default: 10)
-    referralCacheMax: 2000, // Max referral whois responses cached in memory (0 disables cache)
+    referralConcurrency: 10, // Max concurrent live whois queries (default: 10)
     liveReferralMaxProbes: 20000, // Max live-referral probe candidates per run (0 means unlimited)
     customFeedsFile: "/path/to/custom-feeds.txt", // Additional geofeed URLs (one per line)
     disableProcessing: true | false // Download geofeed files but skip processing and validation
@@ -149,4 +147,3 @@ new GeofeedFinder(options) // The options dict is optional, you can just do new 
         // An array of objects { prefix, country, region, city }
     });
 ```
-
