@@ -66,7 +66,7 @@ The application accepts the following parameters:
 
 | Parameter | Description                                                                                                          |
 |-----------|----------------------------------------------------------------------------------------------------------------------|
-| -i        | Include RIRs (comma-separated list). Possible values are ripe, apnic, lacnic, afrinic, and arin.                     | 
+| -i        | Include sources (comma-separated list). Possible values are ripe, apnic, lacnic, afrinic, arin, and caida.            | 
 | -v        | Show version number.                                                                                                 | 
 | -o        | Output file.                                                                                                         | 
 | -t        | Test specific inetnum using RDAP.                                                                                    | 
@@ -121,7 +121,7 @@ Use it:
 
 ```js
 const options = {
-    include: ["ripe", "apnic"], // The RIRs to explore (default: ripe, apnic, lacnic, afrinic, arin),
+    include: ["ripe", "apnic"], // Sources to explore (default: ripe, apnic, lacnic, afrinic, arin, caida),
     whoisCacheDays: 3, // Cache days for whois data (default: 3)
     geofeedCacheDays: 7, // Cache days for geofeed files without cache headers set (default: 7)
     af: [4, 6], // Address family (default, both 4 and 6)

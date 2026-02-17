@@ -118,8 +118,8 @@ const params = yargs
 
             .alias("i", "include")
             .nargs("i", 1)
-            .default("i", "ripe,apnic,lacnic,afrinic,arin")
-            .describe("i", "Include RIRs (comma-separated list)");
+            .default("i", "ripe,apnic,lacnic,afrinic,arin,caida")
+            .describe("i", "Include sources (comma-separated list). Possible values are ripe, apnic, lacnic, afrinic, arin, and caida.");
     })
     .help("h")
     .alias("h", "help")
@@ -146,7 +146,11 @@ const options = {
     removeInvalidSubdivisions: !!params.r,
     disableProcessing: !!params.x,
     customFeedsFile: params.f || null,
-    include: (params.i ?? "ripe,apnic,lacnic,afrinic,arin").split(","),
+    include: (params.i ?? "ripe,apnic,lacnic,afrinic,arin,caida")
+        .toString()
+        .split(",")
+        .map(i => i.trim().toLowerCase())
+        .filter(Boolean),
     output: params.o || "result.csv",
     test: params.t || null,
     downloadTimeout: params.d || 10 // 0 is not a valid value

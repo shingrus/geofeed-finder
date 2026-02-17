@@ -26,7 +26,7 @@ export default class Finder {
             removeInvalidSubdivisions: false,
             disableProcessing: false,
             customFeedsFile: null,
-            include: ["ripe", "afrinic", "apnic", "arin", "lacnic"],
+            include: ["ripe", "afrinic", "apnic", "arin", "lacnic", "caida"],
             output: "result.csv",
             test: null,
             downloadTimeout: 14,
@@ -35,6 +35,7 @@ export default class Finder {
             referralFailFast: false,
             arinLiveReferrals: false,
             liveReferralMaxProbes: 20000,
+            caidaRootUrl: "https://publicdata.caida.org/datasets/geofeed-whois/",
             daysWhoisSuballocationsCache: 7, // Cannot be less than this
             skipSuballocations: false,
             compileSuballocationLocally: false
@@ -52,13 +53,20 @@ export default class Finder {
             livePairs: 0,
             bulkUniqueGeofeeds: 0,
             liveUniqueGeofeeds: 0,
-            totalUniqueGeofeeds: 0
+            totalUniqueGeofeeds: 0,
+            caidaSnapshot: null,
+            caidaListedUrls: 0,
+            caidaAdditionalUrls: 0,
+            caidaDownloadCandidates: 0,
+            caidaDownloadedUrls: 0
         };
 
         this.cacheHeadersIndexFileName = this.cacheDir + "cache-index.json";
         this._importCacheHeaderIndex();
 
-        this.connectors = defaults.include.filter(key => this.params.include.includes(key));
+        this.whoisRepos = ["ripe", "afrinic", "apnic", "arin", "lacnic"];
+        this.connectors = this.whoisRepos.filter(key => this.params.include.includes(key));
+        this._caidaGeofeedUrlsPromise = null;
 
         this.whois = new WhoisParser({
             cacheDir: this.cacheDir,
@@ -259,8 +267,8 @@ export default class Finder {
                 })
             : Promise.resolve([]);
 
-        return Promise.all([
-            this.whois.getObjects(
+        const bulkRecords = this.connectors.length > 0
+            ? this.whois.getObjects(
                 selector,
                 this.filterFunction,
                 standardFields
@@ -269,9 +277,10 @@ export default class Finder {
                 .catch(error => {
                     this.logger.log(`Error: bulk whois records (${error?.message ?? "Unknown error"})`);
                     return [];
-                }),
-            arinExtra
-        ])
+                })
+            : Promise.resolve([]);
+
+        return Promise.all([bulkRecords, arinExtra])
             .then(([bulkBlocks, arinBlocks]) => {
                 const out = [...bulkBlocks, ...arinBlocks]
                     .filter(i => !!i.inetnum || !!i.inet6num);
@@ -284,6 +293,127 @@ export default class Finder {
 
                 return Object.values(index);
             });
+    };
+
+    _parseDirectoryNamesFromIndex = (html = "") => {
+        const matches = [...`${html}`.matchAll(/href="([^"]+)"/gi)];
+        const out = [];
+
+        for (let match of matches) {
+            const href = `${match?.[1] ?? ""}`.trim();
+            if (!href || href.startsWith("?") || href.includes("Parent Directory") || !href.endsWith("/")) {
+                continue;
+            }
+
+            const name = href
+                .split("/")
+                .map(i => i.trim())
+                .filter(Boolean)
+                .pop();
+
+            if (name) {
+                out.push(name);
+            }
+        }
+
+        return [...new Set(out)];
+    };
+
+    _getLatestCaidaSnapshot = () => {
+        const base = `${this.params.caidaRootUrl}`.replace(/\/+$/g, "") + "/";
+        const pickLatest = (url, pattern) => {
+            return axios({url, method: "GET", timeout: 20000})
+                .then(response => {
+                    const names = this._parseDirectoryNamesFromIndex(response?.data)
+                        .filter(name => pattern.test(name))
+                        .sort((a, b) => parseInt(a) - parseInt(b));
+                    return names.pop() || null;
+                });
+        };
+
+        return pickLatest(base, /^\d{4}$/)
+            .then(year => {
+                if (!year) {
+                    return null;
+                }
+                return pickLatest(`${base}${year}/`, /^\d{2}$/)
+                    .then(month => {
+                        if (!month) {
+                            return null;
+                        }
+
+                        return pickLatest(`${base}${year}/${month}/`, /^\d{2}$/)
+                            .then(day => {
+                                if (!day) {
+                                    return null;
+                                }
+
+                                return {year, month, day, url: `${base}${year}/${month}/${day}/`};
+                            });
+                    });
+            });
+    };
+
+    _extractUrlsFromCaidaList = (content = "") => {
+        const urls = content
+            .split(/\r?\n/)
+            .map(i => i.trim())
+            .filter(i => !!i && !i.startsWith("#"))
+            .map(line => line.match(/https?:\/\/[^\s"'<>]+/gi) || [])
+            .flat()
+            .map(url => url.replace(/[),.;]+$/g, ""));
+        return [...new Set(urls)];
+    };
+
+    _fetchCaidaGeofeedUrls = () => {
+        return this._getLatestCaidaSnapshot()
+            .then(snapshot => {
+                if (!snapshot) {
+                    return [];
+                }
+
+                this.discoveryStats.caidaSnapshot = `${snapshot.year}-${snapshot.month}-${snapshot.day}`;
+
+                const files = [
+                    "standard_geofeeds.txt",
+                    "non_standard_geofeeds.txt"
+                ];
+
+                return Promise.allSettled(files.map(file => axios({
+                    url: `${snapshot.url}${file}`,
+                    method: "GET",
+                    timeout: 20000
+                })))
+                    .then(results => {
+                        const out = [];
+                        for (let result of results) {
+                            if (result.status === "fulfilled") {
+                                out.push(...this._extractUrlsFromCaidaList(result.value?.data));
+                            } else {
+                                this.logger.log(`Error: caida source (${result?.reason?.message ?? "Unknown error"})`);
+                            }
+                        }
+                        const urls = [...new Set(out)];
+                        this.discoveryStats.caidaListedUrls = urls.length;
+                        return urls;
+                    });
+            })
+            .catch(error => {
+                this.logger.log(`Error: caida source (${error?.message ?? "Unknown error"})`);
+                return [];
+            });
+    };
+
+    _getCaidaGeofeedUrls = () => {
+        if (!this.params.include.includes("caida")) {
+            return Promise.resolve([]);
+        }
+
+        if (!this._caidaGeofeedUrlsPromise) {
+            this._caidaGeofeedUrlsPromise = this._fetchCaidaGeofeedUrls();
+        }
+
+        return this._caidaGeofeedUrlsPromise;
     };
 
     _getFileName = (file) => {
@@ -375,7 +505,7 @@ export default class Finder {
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
                 this.logger.log(`Error: ${file} timeout`);
-                resolve(null);
+                resolve({file, status: "timeout"});
             }, abortTimeout);
 
             const resolveAndClear = (data) => {
@@ -388,7 +518,7 @@ export default class Finder {
             if (this._isCachedGeofeedValid(cachedFile)) {
 
                 this.logEntry(file, true);
-                resolveAndClear();
+                resolveAndClear({file, status: "cache"});
 
             } else {
 
@@ -409,37 +539,56 @@ export default class Finder {
                             const message = `Error: ${file} is not CSV but HTML, stop with this nonsense!`;
                             this.logger.log(message);
                             console.log(message);
-                            resolveAndClear(null);
+                            resolveAndClear({file, status: "invalid"});
                         } else {
                             fs.writeFileSync(cachedFile, data);
                             this._setGeofeedCacheHeaders(response, cachedFile);
 
-                            resolveAndClear();
+                            resolveAndClear({file, status: "downloaded"});
                         }
                     })
                     .catch(error => {
                         this.logger.log(`Error: ${file} ${error?.message ?? "Unknown error"}`);
-                        resolveAndClear();
+                        resolveAndClear({file, status: "failed"});
                     });
             }
         })
-            .then(() => {}) // Avoid empty logs
-            .catch(() => {}); // Avoid empty logs
+            .catch(() => ({file, status: "failed"})); // Avoid empty logs
     };
 
 
     getGeofeedsFiles = (blocks) => {
         const out = [];
         const customGeofeeds = this._getCustomGeofeedUrls();
-        const uniqueBlocks = [...new Set([...blocks.map(i => i.geofeed), ...customGeofeeds].filter(Boolean))];
-        const half = Math.floor(uniqueBlocks.length / 2);
+        const whoisAndCustomUrls = [...new Set([...blocks.map(i => i.geofeed), ...customGeofeeds].filter(Boolean))];
 
-        // pre load all files
-        return Promise.all([
-            batchPromises(10, uniqueBlocks.slice(0, half), file => this._getGeofeedFile(file)),
-            batchPromises(10, uniqueBlocks.slice(half), file => this._getGeofeedFile(file))
-        ])
-            .then(() => {
+        return this._getCaidaGeofeedUrls()
+            .then(caidaUrls => {
+                const baseSet = new Set(whoisAndCustomUrls);
+                const caidaAdditionalUrls = [...new Set((caidaUrls ?? []).filter(url => !baseSet.has(url)))];
+                const caidaAdditionalSet = new Set(caidaAdditionalUrls);
+                const allUrls = [...new Set([...whoisAndCustomUrls, ...caidaAdditionalUrls])];
+                const urlsToDownload = allUrls.filter(file => !this._isCachedGeofeedValid(this._getFileName(file)));
+                const half = Math.floor(urlsToDownload.length / 2);
+                const caidaDownloadCandidates = urlsToDownload.filter(url => caidaAdditionalSet.has(url)).length;
+
+                this.discoveryStats.caidaAdditionalUrls = caidaAdditionalUrls.length;
+                this.discoveryStats.caidaDownloadCandidates = caidaDownloadCandidates;
+
+                return Promise.all([
+                    batchPromises(10, urlsToDownload.slice(0, half), file => this._getGeofeedFile(file)),
+                    batchPromises(10, urlsToDownload.slice(half), file => this._getGeofeedFile(file))
+                ])
+                    .then(results => {
+                        const downloadResults = results.flat();
+                        this.discoveryStats.caidaDownloadedUrls = downloadResults
+                            .filter(item => item?.status === "downloaded" && caidaAdditionalSet.has(item?.file))
+                            .length;
+
+                        return {caidaAdditionalUrls};
+                    });
+            })
+            .then(({caidaAdditionalUrls}) => {
                 if (this.params.disableProcessing) {
                     console.log("All files downloaded. Processing disabled.");
                     return [];
@@ -462,6 +611,20 @@ export default class Finder {
                 }
 
                 for (let file of customGeofeeds) {
+                    const cachedFile = this._getFileName(file);
+
+                    try {
+                        const data = fs.readFileSync(cachedFile, "utf8");
+
+                        if (data && data.length) {
+                            out.push(this.validateGeofeeds(this.csvParser.parse(null, data)));
+                        }
+                    } catch (error) {
+                        // Nothing - these are files that are not CSV
+                    }
+                }
+
+                for (let file of caidaAdditionalUrls) {
                     const cachedFile = this._getFileName(file);
 
                     try {
@@ -1110,6 +1273,10 @@ export default class Finder {
                 if (!this.params.test && !this.params.silent) {
                     console.log(`[stats] geofeeds_unique bulk=${this.discoveryStats.bulkUniqueGeofeeds} live=${this.discoveryStats.liveUniqueGeofeeds} total=${this.discoveryStats.totalUniqueGeofeeds}`);
                     console.log(`[stats] geofeed_pairs bulk=${this.discoveryStats.bulkPairs} live=${this.discoveryStats.livePairs}`);
+                    if (this.params.include.includes("caida")) {
+                        const snapshot = this.discoveryStats.caidaSnapshot || "unknown";
+                        console.log(`[stats] caida snapshot=${snapshot} listed=${this.discoveryStats.caidaListedUrls} additional=${this.discoveryStats.caidaAdditionalUrls} download_candidates=${this.discoveryStats.caidaDownloadCandidates} downloaded=${this.discoveryStats.caidaDownloadedUrls}`);
+                    }
                 }
                 if (this.params.disableProcessing) {
                     return [];
