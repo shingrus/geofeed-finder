@@ -93,9 +93,12 @@ export default class GeofeedUrlStore {
         `, [JSON.stringify(records)]);
     };
 
-    updateFetchStatus = async (url, status) => {
+    updateFetchStatus = async (url, status, resultText = null) => {
         const normalizedUrl = `${url ?? ""}`.trim();
         const normalizedStatus = `${status ?? ""}`.trim().toLowerCase();
+        const normalizedResultText = resultText === null || resultText === undefined
+            ? null
+            : `${resultText}`.trim() || null;
 
         if (!normalizedUrl || !normalizedStatus) {
             return;
@@ -106,23 +109,26 @@ export default class GeofeedUrlStore {
                 url,
                 last_checked_at,
                 last_success_at,
-                last_fetch_status
+                last_fetch_status,
+                result_text
             )
             VALUES (
                 $1,
                 now(),
                 CASE WHEN $2 = 'downloaded' THEN now() ELSE NULL END,
-                $2
+                $2,
+                CASE WHEN $2 = 'downloaded' OR $2 = 'cache' THEN NULL ELSE $3 END
             )
             ON CONFLICT (url) DO UPDATE
             SET
                 last_checked_at = EXCLUDED.last_checked_at,
                 last_fetch_status = EXCLUDED.last_fetch_status,
+                result_text = EXCLUDED.result_text,
                 last_success_at = CASE
                     WHEN EXCLUDED.last_fetch_status = 'downloaded' THEN EXCLUDED.last_checked_at
                     ELSE geofeed_urls.last_success_at
                 END
-        `, [normalizedUrl, normalizedStatus]);
+        `, [normalizedUrl, normalizedStatus, normalizedResultText]);
     };
 
     close = async () => {

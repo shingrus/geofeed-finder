@@ -165,12 +165,40 @@ export default class Finder {
     };
 
     _recordGeofeedFetchResult = (url, status) => {
+        return this._recordGeofeedFetchResultWithText(url, status, null);
+    };
+
+    _recordGeofeedFetchResultWithText = (url, status, resultText = null) => {
         if (!this.params.pgsql || !url || !status) {
             return Promise.resolve();
         }
 
         return this._getGeofeedUrlStore()
-            .then(store => store?.updateFetchStatus(url, status));
+            .then(store => store?.updateFetchStatus(url, status, resultText));
+    };
+
+    _getFetchResultText = ({status, error, responseData} = {}) => {
+        if (status === "downloaded" || status === "cache") {
+            return null;
+        }
+
+        if (status === "timeout") {
+            return "timeout";
+        }
+
+        if (status === "invalid") {
+            return "html instead of csv";
+        }
+
+        if (error?.message) {
+            return `${error.message}`.trim() || "failed";
+        }
+
+        if (responseData && /<a|<div|<span|<style|<link/gi.test(responseData)) {
+            return "html instead of csv";
+        }
+
+        return status || "failed";
     };
 
     _buildDiscoveredGeofeedUrlRecords = (blocks = [], customGeofeeds = [], caidaUrls = []) => {
@@ -625,21 +653,21 @@ export default class Finder {
 
         return new Promise((resolve, reject) => {
             let settled = false;
-            const finish = (status) => {
+            const finish = (status, resultText = null) => {
                 if (settled) {
                     return;
                 }
 
                 settled = true;
                 clearTimeout(timeout);
-                this._recordGeofeedFetchResult(file, status)
+                this._recordGeofeedFetchResultWithText(file, status, resultText)
                     .then(() => resolve({file, status}))
                     .catch(reject);
             };
 
             const timeout = setTimeout(() => {
                 this.logger.log(`Error: ${file} timeout`);
-                finish("timeout");
+                finish("timeout", this._getFetchResultText({status: "timeout"}));
             }, abortTimeout);
 
             const cachedFile = this._getFileName(file);
@@ -647,7 +675,7 @@ export default class Finder {
             if (this._isCachedGeofeedValid(cachedFile)) {
 
                 this.logEntry(file, true);
-                finish("cache");
+                finish("cache", this._getFetchResultText({status: "cache"}));
                 return;
 
             } else {
@@ -673,12 +701,12 @@ export default class Finder {
                             const message = `Error: ${file} is not CSV but HTML, stop with this nonsense!`;
                             this.logger.log(message);
                             console.log(message);
-                            finish("invalid");
+                            finish("invalid", this._getFetchResultText({status: "invalid", responseData: data}));
                         } else {
                             fs.writeFileSync(cachedFile, data);
                             this._setGeofeedCacheHeaders(response, cachedFile);
 
-                            finish("downloaded");
+                            finish("downloaded", this._getFetchResultText({status: "downloaded"}));
                         }
                     })
                     .catch(error => {
@@ -687,7 +715,7 @@ export default class Finder {
                         }
 
                         this.logger.log(`Error: ${file} ${error?.message ?? "Unknown error"}`);
-                        finish("failed");
+                        finish("failed", this._getFetchResultText({status: "failed", error}));
                     });
             }
         });

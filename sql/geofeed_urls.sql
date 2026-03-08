@@ -6,6 +6,7 @@ create table geofeed_urls (
   last_checked_at timestamptz,
   last_success_at timestamptz,
   last_fetch_status text,
+  result_text text,
   sources text[] not null default '{}'
 );
 
