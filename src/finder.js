@@ -10,6 +10,7 @@ import moment from "moment";
 import ipUtils from "ip-sub";
 import {explicitTransferCheck, lessSpecific} from "whois-wrapper";
 import {execFile} from "child_process";
+import {inspect} from "util";
 
 require("events").EventEmitter.defaultMaxListeners = 200;
 
@@ -177,28 +178,85 @@ export default class Finder {
             .then(store => store?.updateFetchStatus(url, status, resultText));
     };
 
-    _getFetchResultText = ({status, error, responseData} = {}) => {
+    _formatFetchError = (error) => {
+        if (!error) {
+            return "Unknown error";
+        }
+
+        const parts = [];
+        if (error.stack) {
+            parts.push(error.stack);
+        } else if (error.message) {
+            parts.push(`${error.message}`);
+        } else {
+            parts.push(inspect(error, {
+                depth: 8,
+                compact: false,
+                breakLength: Infinity
+            }));
+        }
+
+        const extra = {};
+        for (let key of ["name", "code", "errno", "syscall", "hostname", "type"]) {
+            if (error?.[key] !== undefined && error?.[key] !== null && error?.[key] !== "") {
+                extra[key] = error[key];
+            }
+        }
+
+        if (error?.config) {
+            extra.config = {
+                url: error.config.url,
+                method: error.config.method,
+                timeout: error.config.timeout
+            };
+        }
+
+        if (error?.response) {
+            extra.response = {
+                status: error.response.status,
+                statusText: error.response.statusText,
+                headers: error.response.headers,
+                data: error.response.data
+            };
+        }
+
+        if (error?.cause) {
+            extra.cause = error.cause;
+        }
+
+        if (Object.keys(extra).length > 0) {
+            parts.push(inspect(extra, {
+                depth: 8,
+                compact: false,
+                breakLength: Infinity
+            }));
+        }
+
+        return parts.join("\n");
+    };
+
+    _getFetchResultText = ({status, error, responseData, url, timeoutMs} = {}) => {
         if (status === "downloaded" || status === "cache") {
             return null;
         }
 
         if (status === "timeout") {
-            return "timeout";
+            return `Error: ${url} timeout after ${timeoutMs}ms`;
         }
 
         if (status === "invalid") {
-            return "html instead of csv";
+            return `Error: ${url} returned HTML instead of CSV`;
         }
 
-        if (error?.message) {
-            return `${error.message}`.trim() || "failed";
+        if (error) {
+            return `Error: ${url}\n${this._formatFetchError(error)}`;
         }
 
         if (responseData && /<a|<div|<span|<style|<link/gi.test(responseData)) {
-            return "html instead of csv";
+            return `Error: ${url} returned HTML instead of CSV`;
         }
 
-        return status || "failed";
+        return `Error: ${url} ${status || "failed"}`;
     };
 
     _buildDiscoveredGeofeedUrlRecords = (blocks = [], customGeofeeds = [], caidaUrls = []) => {
@@ -666,8 +724,13 @@ export default class Finder {
             };
 
             const timeout = setTimeout(() => {
-                this.logger.log(`Error: ${file} timeout`);
-                finish("timeout", this._getFetchResultText({status: "timeout"}));
+                const resultText = this._getFetchResultText({
+                    status: "timeout",
+                    url: file,
+                    timeoutMs: abortTimeout
+                });
+                this.logger.log(resultText);
+                finish("timeout", resultText);
             }, abortTimeout);
 
             const cachedFile = this._getFileName(file);
@@ -698,15 +761,19 @@ export default class Finder {
 
                         const data = response.data;
                         if (/<a|<div|<span|<style|<link/gi.test(data)) {
-                            const message = `Error: ${file} is not CSV but HTML, stop with this nonsense!`;
+                            const message = this._getFetchResultText({
+                                status: "invalid",
+                                url: file,
+                                responseData: data
+                            });
                             this.logger.log(message);
                             console.log(message);
-                            finish("invalid", this._getFetchResultText({status: "invalid", responseData: data}));
+                            finish("invalid", message);
                         } else {
                             fs.writeFileSync(cachedFile, data);
                             this._setGeofeedCacheHeaders(response, cachedFile);
 
-                            finish("downloaded", this._getFetchResultText({status: "downloaded"}));
+                            finish("downloaded", this._getFetchResultText({status: "downloaded", url: file}));
                         }
                     })
                     .catch(error => {
@@ -714,8 +781,13 @@ export default class Finder {
                             return;
                         }
 
-                        this.logger.log(`Error: ${file} ${error?.message ?? "Unknown error"}`);
-                        finish("failed", this._getFetchResultText({status: "failed", error}));
+                        const resultText = this._getFetchResultText({
+                            status: "failed",
+                            error,
+                            url: file
+                        });
+                        this.logger.log(resultText);
+                        finish("failed", resultText);
                     });
             }
         });
