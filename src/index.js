@@ -227,6 +227,8 @@ new Finder(options)
 
     })
     .catch(error => {
-        logger.log(error.message);
+        const message = error?.message ?? "Unknown error";
+        console.error(message);
+        logger.log(message);
         exitWhenDone(1);
     });

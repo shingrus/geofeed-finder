@@ -122,7 +122,7 @@ export default class Finder {
         }
 
         if (!this.params.pgsqlUrl) {
-            return Promise.reject(new Error("PGSQL_URL is required when pgsql persistence is enabled"));
+            return Promise.reject(new Error("PGSQL is required when pgsql persistence is enabled"));
         }
 
         if (!this._geofeedUrlStorePromise) {

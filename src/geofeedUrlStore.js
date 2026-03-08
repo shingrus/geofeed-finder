@@ -7,9 +7,7 @@ export default class GeofeedUrlStore {
         try {
             ({Pool} = require("pg"));
         } catch (error) {
-            const message = `Error: PostgreSQL persistence requires the pg package (${error?.message ?? "Unknown error"})`;
-            this.logger?.log?.(message);
-            throw new Error(message);
+            throw new Error(`Error: PostgreSQL persistence requires the pg package (${error?.message ?? "Unknown error"})`);
         }
 
         this.pool = new Pool({
@@ -35,9 +33,7 @@ export default class GeofeedUrlStore {
             return this;
         } catch (error) {
             await this.close();
-            const message = `Error: PostgreSQL geofeed_urls table is unavailable (${error?.message ?? "Unknown error"}). Run sql/geofeed_urls.sql first.`;
-            this._logError(message);
-            throw new Error(message);
+            throw new Error(`Error: PostgreSQL geofeed_urls table is unavailable (${error?.message ?? "Unknown error"}). Run sql/geofeed_urls.sql first.`);
         }
     };
 
