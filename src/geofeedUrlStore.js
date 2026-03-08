@@ -58,11 +58,25 @@ export default class GeofeedUrlStore {
             return;
         }
 
-        const sources = urls.map(url => [...index[url]].sort());
+        const records = urls.map(url => ({
+            url,
+            sources: [...index[url]].sort()
+        }));
 
         await this.pool.query(`
-            WITH incoming(url, sources) AS (
-                SELECT * FROM unnest($1::text[], $2::text[][])
+            WITH incoming AS (
+                SELECT
+                    item->>'url' AS url,
+                    COALESCE(
+                        ARRAY(
+                            SELECT DISTINCT source
+                            FROM jsonb_array_elements_text(COALESCE(item->'sources', '[]'::jsonb)) AS source
+                            WHERE source IS NOT NULL AND btrim(source) <> ''
+                            ORDER BY source
+                        ),
+                        ARRAY[]::text[]
+                    ) AS sources
+                FROM jsonb_array_elements($1::jsonb) AS item
             )
             INSERT INTO geofeed_urls (url, last_seen_at, sources)
             SELECT incoming.url, now(), incoming.sources
@@ -76,7 +90,7 @@ export default class GeofeedUrlStore {
                     WHERE source IS NOT NULL AND btrim(source) <> ''
                     ORDER BY source
                 )
-        `, [urls, sources]);
+        `, [JSON.stringify(records)]);
     };
 
     updateFetchStatus = async (url, status) => {
