@@ -112,6 +112,12 @@ const params = yargs(argv)
             .nargs("d", 1)
             .describe("d", "Interrupt downloading a geofeed file after seconds")
 
+            .option("insecure", {
+                type: "boolean",
+                default: false,
+                describe: "Disable TLS certificate verification for HTTP downloads"
+            })
+
             .alias("f", "custom-feeds")
             .nargs("f", 1)
             .describe("f", "Path to a file with additional geofeed URLs (one per line)")
@@ -154,6 +160,7 @@ const options = {
     keepNonIso: !!params.k,
     keepInvalidSubdivisions: !!params.u,
     removeInvalidSubdivisions: !!params.r,
+    insecure: !!params.insecure,
     disableProcessing: !!params.x,
     customFeedsFile: params.f || null,
     include: (params.i ?? "ripe,apnic,lacnic,afrinic,arin,caida")

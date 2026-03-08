@@ -11,6 +11,7 @@ import ipUtils from "ip-sub";
 import {explicitTransferCheck, lessSpecific} from "whois-wrapper";
 import {execFile} from "child_process";
 import {inspect} from "util";
+import {Agent} from "undici";
 
 require("events").EventEmitter.defaultMaxListeners = 200;
 
@@ -41,6 +42,7 @@ export default class Finder {
             daysWhoisSuballocationsCache: 7, // Cannot be less than this
             skipSuballocations: false,
             compileSuballocationLocally: false,
+            insecure: false,
             pgsql: false,
             pgsqlUrl: null
         };
@@ -72,6 +74,7 @@ export default class Finder {
         this.connectors = this.whoisRepos.filter(key => this.params.include.includes(key));
         this._caidaGeofeedUrlsPromise = null;
         this._geofeedUrlStorePromise = null;
+        this._insecureHttpDispatcher = null;
 
         this.whoisParsers = {};
         for (let repo of this.connectors) {
@@ -105,8 +108,56 @@ export default class Finder {
         return `${value ?? ""}`.trim();
     };
 
+    _sanitizeExtractedUrl = (value) => {
+        return this._cleanString(value)
+            .replace(/[\^\)\]\}>.,;:]+$/g, "")
+            .trim();
+    };
+
     _normalizeDiscoverySource = (value) => {
         return this._cleanString(value).toLowerCase();
+    };
+
+    _getRequestFetch = () => {
+        if (!this.params.insecure) {
+            return fetch;
+        }
+
+        if (!this._insecureHttpDispatcher) {
+            this._insecureHttpDispatcher = new Agent({
+                connect: {
+                    rejectUnauthorized: false
+                }
+            });
+        }
+
+        return (url, options = {}) => {
+            return fetch(url, {
+                ...options,
+                dispatcher: this._insecureHttpDispatcher
+            });
+        };
+    };
+
+    _closeRequestFetch = async () => {
+        if (!this._insecureHttpDispatcher) {
+            return;
+        }
+
+        try {
+            await this._insecureHttpDispatcher.close();
+        } catch (error) {
+            this.logger?.log?.(`Error: insecure HTTP dispatcher shutdown (${error?.message ?? "Unknown error"})`);
+        } finally {
+            this._insecureHttpDispatcher = null;
+        }
+    };
+
+    _axiosRequest = (config = {}) => {
+        return axios({
+            ...config,
+            fetch: this._getRequestFetch()
+        });
     };
 
     _mergeDiscoverySources = (...sources) => {
@@ -529,7 +580,7 @@ export default class Finder {
     _getLatestCaidaSnapshot = () => {
         const base = `${this.params.caidaRootUrl}`.replace(/\/+$/g, "") + "/";
         const pickLatest = (url, pattern) => {
-            return axios({url, method: "GET", timeout: 20000})
+            return this._axiosRequest({url, method: "GET", timeout: 20000})
                 .then(response => {
                     const names = this._parseDirectoryNamesFromIndex(response?.data)
                         .filter(name => pattern.test(name))
@@ -568,7 +619,8 @@ export default class Finder {
             .filter(i => !!i && !i.startsWith("#"))
             .map(line => line.match(/https?:\/\/[^\s"'<>]+/gi) || [])
             .flat()
-            .map(url => url.replace(/[),.;]+$/g, ""));
+            .map(this._sanitizeExtractedUrl)
+            .filter(Boolean);
         return [...new Set(urls)];
     };
 
@@ -586,7 +638,7 @@ export default class Finder {
                     "non_standard_geofeeds.txt"
                 ];
 
-                return Promise.allSettled(files.map(file => axios({
+                return Promise.allSettled(files.map(file => this._axiosRequest({
                     url: `${snapshot.url}${file}`,
                     method: "GET",
                     timeout: 20000
@@ -749,7 +801,7 @@ export default class Finder {
 
                 this.logEntry(file, false);
 
-                axios({
+                this._axiosRequest({
                     url: file,
                     method: "GET",
                     timeout: abortTimeout
@@ -982,7 +1034,7 @@ export default class Finder {
 
     matchGeofeedFile = (remark) => {
         const urls = `${remark ?? ""}`.match(/\bhttps?:\/\/[^\s"'<>]+/gi) || [];
-        return [...new Set(urls.map(url => url.replace(/[),.;]+$/g, "")))];
+        return [...new Set(urls.map(this._sanitizeExtractedUrl).filter(Boolean))];
     };
 
     _extractGeofeedUrlsFromObject = (object = {}) => {
@@ -1231,7 +1283,7 @@ export default class Finder {
                 return Promise.resolve(candidates);
             }
 
-            return axios({
+            return this._axiosRequest({
                 url: config.delegatedUrl,
                 method: "GET",
                 timeout: 20000
@@ -1541,7 +1593,10 @@ export default class Finder {
                 }
                 return this.params.test ? data : this.setGeofeedPriority(data);
             })
-            .finally(() => this._closeGeofeedUrlStore());
+            .finally(() => Promise.allSettled([
+                this._closeGeofeedUrlStore(),
+                this._closeRequestFetch()
+            ]));
     };
 
 }

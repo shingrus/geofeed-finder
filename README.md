@@ -78,6 +78,7 @@ The application accepts the following parameters:
 | -r        | Remove invalid subdivisions but keep the rest of the geofeed if valid.                                               | 
 | -z        | Include Zip codes. Not recommended. Zip codes are deprecated in geofeed and by default are excluded from the output. | 
 | -d        | Download timeout. Interrupt downloading a geofeed file after seconds. Default: 10 seconds.                           |
+| --insecure| Disable TLS certificate verification for HTTP downloads. Disabled by default.                                         |
 | -f        | Path to a file with additional geofeed URLs (one per line).                                                          |
 | --pgsql   | Persist discovered geofeed URLs to PostgreSQL using `PGSQL`. `-pgsql` is accepted too.                              |
 | -x        | Download geofeed files but skip processing and validation.                                                           |
@@ -133,6 +134,7 @@ const options = {
     keepNonIso: true | false, // Don't validate ISO codes (default: false)
     keepInvalidSubdivisions: true | false, // Don't validate ISO codes of the subdivisions (default: false)
     removeInvalidSubdivisions: true | false, // Remove invalid subdivisions but keep the rest of the geofeed if valid (default: false)
+    insecure: true | false, // Disable TLS certificate verification for Finder HTTP downloads (default: false)
     skipSuballocations: true | false, // Skip fetching ARIN sub allocations
     test: "ip/prefix", // Test specific ip/prefix using RDAP
     output: "result.csv", // Output file (default: "result.csv")
