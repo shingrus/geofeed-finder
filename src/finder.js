@@ -3,6 +3,7 @@ import axios from "redaxios";
 import WhoisParser from "bulk-whois-parser";
 import LongestPrefixMatch from "longest-prefix-match";
 import CsvParser from "./csvParser";
+import GeofeedUrlStore from "./geofeedUrlStore";
 import md5 from "md5";
 import fs from "fs";
 import moment from "moment";
@@ -38,7 +39,9 @@ export default class Finder {
             caidaRootUrl: "https://publicdata.caida.org/datasets/geofeed-whois/",
             daysWhoisSuballocationsCache: 7, // Cannot be less than this
             skipSuballocations: false,
-            compileSuballocationLocally: false
+            compileSuballocationLocally: false,
+            pgsql: false,
+            pgsqlUrl: null
         };
         this.params = {
             ...defaults,
@@ -67,31 +70,21 @@ export default class Finder {
         this.whoisRepos = ["ripe", "afrinic", "apnic", "arin", "lacnic"];
         this.connectors = this.whoisRepos.filter(key => this.params.include.includes(key));
         this._caidaGeofeedUrlsPromise = null;
+        this._geofeedUrlStorePromise = null;
 
-        this.whois = new WhoisParser({
-            cacheDir: this.cacheDir,
-            repos: this.connectors,
-            daysWhoisSuballocationsCache: this.params.daysWhoisSuballocationsCache,
-            skipSuballocations: this.params.skipSuballocations,
-            defaultCacheDays: this.params.whoisCacheDays,
-            compileSuballocationLocally: this.params.compileSuballocationLocally,
-            userAgent: "geofeed-finder",
-            deleteCorruptedCacheFile: true
-        });
-
-        // ARIN referral records are mostly in the RR dump (NetRange objects), not in ARIN's RDAP-derived inetnum list.
-        this.arinWhois = this.params.include.includes("arin")
-            ? new WhoisParser({
+        this.whoisParsers = {};
+        for (let repo of this.connectors) {
+            this.whoisParsers[repo] = new WhoisParser({
                 cacheDir: this.cacheDir,
-                repos: ["arin"],
+                repos: [repo],
                 daysWhoisSuballocationsCache: this.params.daysWhoisSuballocationsCache,
                 skipSuballocations: this.params.skipSuballocations,
                 defaultCacheDays: this.params.whoisCacheDays,
                 compileSuballocationLocally: this.params.compileSuballocationLocally,
                 userAgent: "geofeed-finder",
                 deleteCorruptedCacheFile: true
-            })
-            : null;
+            });
+        }
     };
 
 
@@ -109,6 +102,108 @@ export default class Finder {
 
     _cleanString = (value) => {
         return `${value ?? ""}`.trim();
+    };
+
+    _normalizeDiscoverySource = (value) => {
+        return this._cleanString(value).toLowerCase();
+    };
+
+    _mergeDiscoverySources = (...sources) => {
+        return [...new Set(sources
+            .flat()
+            .map(this._normalizeDiscoverySource)
+            .filter(Boolean))]
+            .sort();
+    };
+
+    _getGeofeedUrlStore = () => {
+        if (!this.params.pgsql) {
+            return Promise.resolve(null);
+        }
+
+        if (!this.params.pgsqlUrl) {
+            return Promise.reject(new Error("PGSQL_URL is required when pgsql persistence is enabled"));
+        }
+
+        if (!this._geofeedUrlStorePromise) {
+            const store = new GeofeedUrlStore({
+                url: this.params.pgsqlUrl,
+                logger: this.logger
+            });
+
+            this._geofeedUrlStorePromise = store.connect()
+                .then(() => store)
+                .catch(error => {
+                    this._geofeedUrlStorePromise = null;
+                    throw error;
+                });
+        }
+
+        return this._geofeedUrlStorePromise;
+    };
+
+    _closeGeofeedUrlStore = () => {
+        if (!this._geofeedUrlStorePromise) {
+            return Promise.resolve();
+        }
+
+        return this._geofeedUrlStorePromise
+            .then(store => store?.close?.())
+            .catch(() => null)
+            .then(() => {
+                this._geofeedUrlStorePromise = null;
+            });
+    };
+
+    _upsertDiscoveredGeofeedUrls = (items = []) => {
+        if (!this.params.pgsql || !items.length) {
+            return Promise.resolve();
+        }
+
+        return this._getGeofeedUrlStore()
+            .then(store => store?.upsertDiscoveredUrls(items));
+    };
+
+    _recordGeofeedFetchResult = (url, status) => {
+        if (!this.params.pgsql || !url || !status) {
+            return Promise.resolve();
+        }
+
+        return this._getGeofeedUrlStore()
+            .then(store => store?.updateFetchStatus(url, status));
+    };
+
+    _buildDiscoveredGeofeedUrlRecords = (blocks = [], customGeofeeds = [], caidaUrls = []) => {
+        const index = {};
+        const add = (url, sources = []) => {
+            const normalizedUrl = this._cleanString(url);
+            if (!normalizedUrl) {
+                return;
+            }
+
+            index[normalizedUrl] ??= new Set();
+            for (let source of this._mergeDiscoverySources(sources)) {
+                index[normalizedUrl].add(source);
+            }
+        };
+
+        for (let block of blocks ?? []) {
+            add(block?.geofeed, block?.discoverySources);
+        }
+
+        for (let url of customGeofeeds ?? []) {
+            add(url, ["custom"]);
+        }
+
+        for (let url of caidaUrls ?? []) {
+            add(url, ["caida"]);
+        }
+
+        return Object.entries(index)
+            .map(([url, sources]) => ({
+                url,
+                sources: [...sources].sort()
+            }));
     };
 
     _getObjectValuesByKeys = (object, keys = []) => {
@@ -247,8 +342,29 @@ export default class Finder {
             arinTypes.push("Net6CIDRBlock");
         }
 
-        const arinExtra = this.arinWhois && arinTypes.length > 0
-            ? this.arinWhois.getObjects(
+        const loadBulkRecordsForRepo = (repo) => {
+            const parser = this.whoisParsers[repo];
+            if (!parser) {
+                return Promise.resolve([]);
+            }
+
+            return parser.getObjects(
+                selector,
+                this.filterFunction,
+                standardFields
+            )
+                .then(blocks => blocks.flat().map(block => ({
+                    ...block,
+                    discoverySources: this._mergeDiscoverySources(block?.discoverySources, [repo])
+                })))
+                .catch(error => {
+                    this.logger.log(`Error: ${repo} bulk whois records (${error?.message ?? "Unknown error"})`);
+                    return [];
+                });
+        };
+
+        const arinExtra = this.whoisParsers.arin && arinTypes.length > 0
+            ? this.whoisParsers.arin.getObjects(
                 arinTypes,
                 this.filterFunction,
                 [
@@ -260,35 +376,40 @@ export default class Finder {
                     "Updated"
                 ]
             )
-                .then(blocks => blocks.flat().map(this._normalizeArinNetRangeObject))
+                .then(blocks => blocks.flat().map(this._normalizeArinNetRangeObject).map(block => ({
+                    ...block,
+                    discoverySources: this._mergeDiscoverySources(block?.discoverySources, ["arin"])
+                })))
                 .catch(error => {
                     this.logger.log(`Error: ARIN bulk records (${error?.message ?? "Unknown error"})`);
                     return [];
                 })
             : Promise.resolve([]);
 
-        const bulkRecords = this.connectors.length > 0
-            ? this.whois.getObjects(
-                selector,
-                this.filterFunction,
-                standardFields
-            )
-                .then(blocks => blocks.flat())
-                .catch(error => {
-                    this.logger.log(`Error: bulk whois records (${error?.message ?? "Unknown error"})`);
-                    return [];
-                })
-            : Promise.resolve([]);
-
-        return Promise.all([bulkRecords, arinExtra])
-            .then(([bulkBlocks, arinBlocks]) => {
-                const out = [...bulkBlocks, ...arinBlocks]
+        return Promise.all([
+            ...this.connectors.map(loadBulkRecordsForRepo),
+            arinExtra
+        ])
+            .then((results) => {
+                const out = results
+                    .flat()
                     .filter(i => !!i.inetnum || !!i.inet6num);
 
                 const index = {};
                 for (let block of out) {
-                    const id = `${block.inetnum || block.inet6num}|${block.geofeed || ""}`;
-                    index[id] = block;
+                    const geofeedKey = this._extractGeofeedUrlsFromObject(block).join("|");
+                    const id = `${block.inetnum || block.inet6num}|${geofeedKey}`;
+                    const previous = index[id];
+                    if (!previous) {
+                        index[id] = block;
+                        continue;
+                    }
+
+                    index[id] = {
+                        ...previous,
+                        ...block,
+                        discoverySources: this._mergeDiscoverySources(previous.discoverySources, block.discoverySources)
+                    };
                 }
 
                 return Object.values(index);
@@ -503,22 +624,31 @@ export default class Finder {
         const abortTimeout = parseInt(this.params.downloadTimeout) * 1000;
 
         return new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (status) => {
+                if (settled) {
+                    return;
+                }
+
+                settled = true;
+                clearTimeout(timeout);
+                this._recordGeofeedFetchResult(file, status)
+                    .then(() => resolve({file, status}))
+                    .catch(reject);
+            };
+
             const timeout = setTimeout(() => {
                 this.logger.log(`Error: ${file} timeout`);
-                resolve({file, status: "timeout"});
+                finish("timeout");
             }, abortTimeout);
-
-            const resolveAndClear = (data) => {
-                resolve(data);
-                clearTimeout(timeout);
-            };
 
             const cachedFile = this._getFileName(file);
 
             if (this._isCachedGeofeedValid(cachedFile)) {
 
                 this.logEntry(file, true);
-                resolveAndClear({file, status: "cache"});
+                finish("cache");
+                return;
 
             } else {
 
@@ -534,26 +664,33 @@ export default class Finder {
                     timeout: abortTimeout
                 })
                     .then(response => {
+                        if (settled) {
+                            return;
+                        }
+
                         const data = response.data;
                         if (/<a|<div|<span|<style|<link/gi.test(data)) {
                             const message = `Error: ${file} is not CSV but HTML, stop with this nonsense!`;
                             this.logger.log(message);
                             console.log(message);
-                            resolveAndClear({file, status: "invalid"});
+                            finish("invalid");
                         } else {
                             fs.writeFileSync(cachedFile, data);
                             this._setGeofeedCacheHeaders(response, cachedFile);
 
-                            resolveAndClear({file, status: "downloaded"});
+                            finish("downloaded");
                         }
                     })
                     .catch(error => {
+                        if (settled) {
+                            return;
+                        }
+
                         this.logger.log(`Error: ${file} ${error?.message ?? "Unknown error"}`);
-                        resolveAndClear({file, status: "failed"});
+                        finish("failed");
                     });
             }
-        })
-            .catch(() => ({file, status: "failed"})); // Avoid empty logs
+        });
     };
 
 
@@ -567,18 +704,23 @@ export default class Finder {
                 const baseSet = new Set(whoisAndCustomUrls);
                 const caidaAdditionalUrls = [...new Set((caidaUrls ?? []).filter(url => !baseSet.has(url)))];
                 const caidaAdditionalSet = new Set(caidaAdditionalUrls);
-                const allUrls = [...new Set([...whoisAndCustomUrls, ...caidaAdditionalUrls])];
-                const urlsToDownload = allUrls.filter(file => !this._isCachedGeofeedValid(this._getFileName(file)));
-                const half = Math.floor(urlsToDownload.length / 2);
-                const caidaDownloadCandidates = urlsToDownload.filter(url => caidaAdditionalSet.has(url)).length;
+                const allUrls = [...new Set([...whoisAndCustomUrls, ...(caidaUrls ?? [])])];
+                const urlsToCheck = allUrls;
+                const half = Math.floor(urlsToCheck.length / 2);
+                const caidaDownloadCandidates = urlsToCheck
+                    .filter(url => caidaAdditionalSet.has(url))
+                    .filter(url => !this._isCachedGeofeedValid(this._getFileName(url)))
+                    .length;
+                const discoveredUrls = this._buildDiscoveredGeofeedUrlRecords(blocks, customGeofeeds, caidaUrls);
 
                 this.discoveryStats.caidaAdditionalUrls = caidaAdditionalUrls.length;
                 this.discoveryStats.caidaDownloadCandidates = caidaDownloadCandidates;
 
-                return Promise.all([
-                    batchPromises(10, urlsToDownload.slice(0, half), file => this._getGeofeedFile(file)),
-                    batchPromises(10, urlsToDownload.slice(half), file => this._getGeofeedFile(file))
-                ])
+                return this._upsertDiscoveredGeofeedUrls(discoveredUrls)
+                    .then(() => Promise.all([
+                        batchPromises(10, urlsToCheck.slice(0, half), file => this._getGeofeedFile(file)),
+                        batchPromises(10, urlsToCheck.slice(half), file => this._getGeofeedFile(file))
+                    ]))
                     .then(results => {
                         const downloadResults = results.flat();
                         this.discoveryStats.caidaDownloadedUrls = downloadResults
@@ -685,9 +827,17 @@ export default class Finder {
         const index = {};
         for (let inetnum of inetnums) {
             const key = `${inetnum.inetnum}|${inetnum.geofeed}`;
-            index[key] = (!index[key] || index[key].lastUpdate < inetnum.lastUpdate) ?
-                inetnum :
-                index[key];
+            const previous = index[key];
+            const discoverySources = this._mergeDiscoverySources(previous?.discoverySources, inetnum?.discoverySources);
+
+            if (!previous || previous.lastUpdate < inetnum.lastUpdate) {
+                index[key] = {
+                    ...inetnum,
+                    discoverySources
+                };
+            } else {
+                previous.discoverySources = discoverySources;
+            }
         }
 
         return Object.values(index);
@@ -1076,7 +1226,8 @@ export default class Finder {
                                 out.push({
                                     inetnum: candidate.inetnum,
                                     geofeed,
-                                    lastUpdate: candidate.lastUpdate
+                                    lastUpdate: candidate.lastUpdate,
+                                    discoverySources: [candidate.rir]
                                 });
                             }
                         } else {
@@ -1163,6 +1314,7 @@ export default class Finder {
         const inetnums = this._extractInetnums(object);
         const geofeeds = this._extractGeofeedUrlsFromObject(object);
         const lastUpdate = this._getLastUpdate(object);
+        const discoverySources = this._mergeDiscoverySources(object?.discoverySources);
 
         if (!geofeeds.length || !inetnums.length) {
             return [];
@@ -1171,7 +1323,7 @@ export default class Finder {
         const out = [];
         for (let inetnum of inetnums) {
             for (let geofeed of geofeeds) {
-                out.push({inetnum, geofeed, lastUpdate});
+                out.push({inetnum, geofeed, lastUpdate, discoverySources});
             }
         }
 
@@ -1232,7 +1384,8 @@ export default class Finder {
                                         geofeed,
                                         strict,
                                         whois: item,
-                                        lastUpdate: moment() // It doesn't matter in this case
+                                        lastUpdate: moment(), // It doesn't matter in this case
+                                        discoverySources: ["rdap-test"]
                                     };
                                 });
                             }
@@ -1266,7 +1419,12 @@ export default class Finder {
     };
 
     getGeofeeds = () => {
-        return this.getGeofeedInetnumPairs()
+        const initializePersistence = this.params.pgsql
+            ? this._getGeofeedUrlStore()
+            : Promise.resolve();
+
+        return initializePersistence
+            .then(() => this.getGeofeedInetnumPairs())
             .then(this.getGeofeedsFiles)
             .then(data => {
                 this._persistCacheIndex();
@@ -1282,7 +1440,8 @@ export default class Finder {
                     return [];
                 }
                 return this.params.test ? data : this.setGeofeedPriority(data);
-            });
+            })
+            .finally(() => this._closeGeofeedUrlStore());
     };
 
 }

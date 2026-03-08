@@ -18,8 +18,12 @@ const logger = new FileLogger({
     format: ({data, timestamp}) => `${timestamp} ${data}`
 });
 
+const argv = process.argv
+    .slice(2)
+    .map(arg => arg === "-pgsql" ? "--pgsql" : arg);
 
-const params = yargs
+
+const params = yargs(argv)
     .usage("Usage: $0 <command> [options]")
 
     .command("$0", "Run Geofeed finder (default)", function () {
@@ -112,6 +116,12 @@ const params = yargs
             .nargs("f", 1)
             .describe("f", "Path to a file with additional geofeed URLs (one per line)")
 
+            .option("pgsql", {
+                type: "boolean",
+                default: false,
+                describe: "Persist discovered geofeed URLs to PostgreSQL using PGSQL"
+            })
+
             .alias("x", "disable-processing")
             .nargs("x", 0)
             .describe("x", "Download geofeed files but skip processing and validation")
@@ -151,6 +161,8 @@ const options = {
         .split(",")
         .map(i => i.trim().toLowerCase())
         .filter(Boolean),
+    pgsql: !!params.pgsql,
+    pgsqlUrl: process.env.PGSQL || null,
     output: params.o || "result.csv",
     test: params.t || null,
     downloadTimeout: params.d || 10 // 0 is not a valid value

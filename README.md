@@ -79,6 +79,7 @@ The application accepts the following parameters:
 | -z        | Include Zip codes. Not recommended. Zip codes are deprecated in geofeed and by default are excluded from the output. | 
 | -d        | Download timeout. Interrupt downloading a geofeed file after seconds. Default: 10 seconds.                           |
 | -f        | Path to a file with additional geofeed URLs (one per line).                                                          |
+| --pgsql   | Persist discovered geofeed URLs to PostgreSQL using `PGSQL`. `-pgsql` is accepted too.                              |
 | -x        | Download geofeed files but skip processing and validation.                                                           |
 | -m        | Enable extra live whois probes (slow, network-heavy).                                                               |
 | -j        | Max concurrent live whois queries. Default: 10.                                                                     |
@@ -89,6 +90,8 @@ The application accepts the following parameters:
 | -l        | Cache directory. Default: `.cache`.                                                                                  |
 
 Use `-h` for more options. See [here](https://github.com/massimocandela/geofeed-finder/issues/31) more information about `-k`, `-u`, and `-r`.
+
+To enable PostgreSQL persistence, create the schema from [sql/geofeed_urls.sql](./sql/geofeed_urls.sql), export `PGSQL`, and run the finder with `--pgsql`.
 
 
 Downloading data from ARIN whois takes longer. 
@@ -137,6 +140,8 @@ const options = {
     referralConcurrency: 10, // Max concurrent live whois queries (default: 10)
     liveReferralMaxProbes: 20000, // Max live-referral probe candidates per run (0 means unlimited)
     customFeedsFile: "/path/to/custom-feeds.txt", // Additional geofeed URLs (one per line)
+    pgsql: true | false, // Enable PostgreSQL persistence (default: false)
+    pgsqlUrl: process.env.PGSQL || null, // PostgreSQL connection string used when pgsql=true
     disableProcessing: true | false // Download geofeed files but skip processing and validation
 };
 
