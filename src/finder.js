@@ -168,6 +168,37 @@ export default class Finder {
             .sort();
     };
 
+    _upsertGeofeedInetnumPair = (index, pair) => {
+        if (!pair?.inetnum || !pair?.geofeed) {
+            return;
+        }
+
+        const key = `${pair.inetnum}|${pair.geofeed}`;
+        const previous = index.get(key);
+        const discoverySources = this._mergeDiscoverySources(previous?.discoverySources, pair?.discoverySources);
+
+        if (!previous || previous.lastUpdate < pair.lastUpdate) {
+            index.set(key, {
+                ...pair,
+                discoverySources
+            });
+            return;
+        }
+
+        previous.discoverySources = discoverySources;
+    };
+
+    _mergeTranslatedObjectPairs = (index, object, discoverySources = []) => {
+        const translatedPairs = this.translateObject({
+            ...object,
+            discoverySources: this._mergeDiscoverySources(object?.discoverySources, discoverySources)
+        });
+
+        for (let pair of translatedPairs) {
+            this._upsertGeofeedInetnumPair(index, pair);
+        }
+    };
+
     _getGeofeedUrlStore = () => {
         if (!this.params.pgsql) {
             return Promise.resolve(null);
@@ -455,7 +486,7 @@ export default class Finder {
         return false;
     };
 
-    getBlocks = () => {
+    _getBulkGeofeedInetnumPairs = () => {
         const selector = this.params.af
             .map(i => i === 4 ? "inetnum" : "inet6num");
         const standardFields = [
@@ -485,23 +516,23 @@ export default class Finder {
                 return Promise.resolve([]);
             }
 
-            return parser.getObjects(
+            return parser.forEachObject(
                 selector,
                 this.filterFunction,
-                standardFields
+                standardFields,
+                (object) => {
+                    this._mergeTranslatedObjectPairs(index, object, [repo]);
+                }
             )
-                .then(blocks => blocks.flat().map(block => ({
-                    ...block,
-                    discoverySources: this._mergeDiscoverySources(block?.discoverySources, [repo])
-                })))
                 .catch(error => {
                     this.logger.log(`Error: ${repo} bulk whois records (${error?.message ?? "Unknown error"})`);
-                    return [];
+                    return null;
                 });
         };
 
+        const index = new Map();
         const arinExtra = this.whoisParsers.arin && arinTypes.length > 0
-            ? this.whoisParsers.arin.getObjects(
+            ? this.whoisParsers.arin.forEachObject(
                 arinTypes,
                 this.filterFunction,
                 [
@@ -511,46 +542,22 @@ export default class Finder {
                     "Comment",
                     "comments",
                     "Updated"
-                ]
+                ],
+                (object) => {
+                    this._mergeTranslatedObjectPairs(index, this._normalizeArinNetRangeObject(object), ["arin"]);
+                }
             )
-                .then(blocks => blocks.flat().map(this._normalizeArinNetRangeObject).map(block => ({
-                    ...block,
-                    discoverySources: this._mergeDiscoverySources(block?.discoverySources, ["arin"])
-                })))
                 .catch(error => {
                     this.logger.log(`Error: ARIN bulk records (${error?.message ?? "Unknown error"})`);
-                    return [];
+                    return null;
                 })
-            : Promise.resolve([]);
+            : Promise.resolve(null);
 
         return Promise.all([
             ...this.connectors.map(loadBulkRecordsForRepo),
             arinExtra
         ])
-            .then((results) => {
-                const out = results
-                    .flat()
-                    .filter(i => !!i.inetnum || !!i.inet6num);
-
-                const index = {};
-                for (let block of out) {
-                    const geofeedKey = this._extractGeofeedUrlsFromObject(block).join("|");
-                    const id = `${block.inetnum || block.inet6num}|${geofeedKey}`;
-                    const previous = index[id];
-                    if (!previous) {
-                        index[id] = block;
-                        continue;
-                    }
-
-                    index[id] = {
-                        ...previous,
-                        ...block,
-                        discoverySources: this._mergeDiscoverySources(previous.discoverySources, block.discoverySources)
-                    };
-                }
-
-                return Object.values(index);
-            });
+            .then(() => [...index.values()]);
     };
 
     _parseDirectoryNamesFromIndex = (html = "") => {
@@ -1547,22 +1554,19 @@ export default class Finder {
                     });
 
             } else {
-                return this.getBlocks()
-                    .then((objects = []) => {
-                        const bulkPairs = objects.map(this.translateObject).flat();
-                        return this._getLiveReferralGeofeedPairs(bulkPairs)
-                            .then((liveReferralPairs) => {
-                                this.discoveryStats = {
-                                    bulkPairs: bulkPairs.length,
-                                    livePairs: liveReferralPairs.length,
-                                    bulkUniqueGeofeeds: this._countUniqueGeofeeds(bulkPairs),
-                                    liveUniqueGeofeeds: this._countUniqueGeofeeds(liveReferralPairs),
-                                    totalUniqueGeofeeds: this._countUniqueGeofeeds([...bulkPairs, ...liveReferralPairs])
-                                };
+                return this._getBulkGeofeedInetnumPairs()
+                    .then((bulkPairs = []) => this._getLiveReferralGeofeedPairs(bulkPairs)
+                        .then((liveReferralPairs) => {
+                            this.discoveryStats = {
+                                bulkPairs: bulkPairs.length,
+                                livePairs: liveReferralPairs.length,
+                                bulkUniqueGeofeeds: this._countUniqueGeofeeds(bulkPairs),
+                                liveUniqueGeofeeds: this._countUniqueGeofeeds(liveReferralPairs),
+                                totalUniqueGeofeeds: this._countUniqueGeofeeds([...bulkPairs, ...liveReferralPairs])
+                            };
 
-                                return [...bulkPairs, ...liveReferralPairs];
-                            });
-                    })
+                            return [...bulkPairs, ...liveReferralPairs];
+                        }))
                     .then(this.getMostUpdatedInetnums);
             }
         } catch (error) {
