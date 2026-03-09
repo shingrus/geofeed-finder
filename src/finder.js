@@ -168,6 +168,15 @@ export default class Finder {
             .sort();
     };
 
+    _mergeDiscoveredGeofeedUrl = (index, url, sources = []) => {
+        const normalizedUrl = this._cleanString(url);
+        if (!normalizedUrl) {
+            return;
+        }
+
+        index.set(normalizedUrl, this._mergeDiscoverySources(index.get(normalizedUrl), sources));
+    };
+
     _upsertGeofeedInetnumPair = (index, pair) => {
         if (!pair?.inetnum || !pair?.geofeed) {
             return;
@@ -188,15 +197,21 @@ export default class Finder {
         previous.discoverySources = discoverySources;
     };
 
-    _mergeTranslatedObjectPairs = (index, object, discoverySources = []) => {
+    _visitTranslatedObjectPairs = (object, discoverySources = [], visitor = null) => {
         const translatedPairs = this.translateObject({
             ...object,
             discoverySources: this._mergeDiscoverySources(object?.discoverySources, discoverySources)
         });
 
         for (let pair of translatedPairs) {
-            this._upsertGeofeedInetnumPair(index, pair);
+            visitor?.(pair);
         }
+    };
+
+    _mergeTranslatedObjectPairs = (index, object, discoverySources = []) => {
+        this._visitTranslatedObjectPairs(object, discoverySources, pair => {
+            this._upsertGeofeedInetnumPair(index, pair);
+        });
     };
 
     _getGeofeedUrlStore = () => {
@@ -341,33 +356,31 @@ export default class Finder {
         return `Error: ${url} ${status || "failed"}`;
     };
 
-    _buildDiscoveredGeofeedUrlRecords = (blocks = [], customGeofeeds = [], caidaUrls = []) => {
-        const index = {};
-        const add = (url, sources = []) => {
-            const normalizedUrl = this._cleanString(url);
-            if (!normalizedUrl) {
-                return;
-            }
-
-            index[normalizedUrl] ??= new Set();
-            for (let source of this._mergeDiscoverySources(sources)) {
-                index[normalizedUrl].add(source);
-            }
-        };
+    _buildDiscoveredGeofeedUrlRecords = ({
+        blocks = [],
+        discoveredUrlRecords = [],
+        customGeofeeds = [],
+        caidaUrls = []
+    } = {}) => {
+        const index = new Map();
 
         for (let block of blocks ?? []) {
-            add(block?.geofeed, block?.discoverySources);
+            this._mergeDiscoveredGeofeedUrl(index, block?.geofeed, block?.discoverySources);
+        }
+
+        for (let item of discoveredUrlRecords ?? []) {
+            this._mergeDiscoveredGeofeedUrl(index, item?.url, item?.sources);
         }
 
         for (let url of customGeofeeds ?? []) {
-            add(url, ["custom"]);
+            this._mergeDiscoveredGeofeedUrl(index, url, ["custom"]);
         }
 
         for (let url of caidaUrls ?? []) {
-            add(url, ["caida"]);
+            this._mergeDiscoveredGeofeedUrl(index, url, ["caida"]);
         }
 
-        return Object.entries(index)
+        return [...index.entries()]
             .map(([url, sources]) => ({
                 url,
                 sources: [...sources].sort()
@@ -486,7 +499,7 @@ export default class Finder {
         return false;
     };
 
-    _getBulkGeofeedInetnumPairs = () => {
+    _getBulkGeofeedInetnumPairs = (onPair = null) => {
         const selector = this.params.af
             .map(i => i === 4 ? "inetnum" : "inet6num");
         const standardFields = [
@@ -521,7 +534,11 @@ export default class Finder {
                 this.filterFunction,
                 standardFields,
                 (object) => {
-                    this._mergeTranslatedObjectPairs(index, object, [repo]);
+                    if (onPair) {
+                        this._visitTranslatedObjectPairs(object, [repo], onPair);
+                    } else {
+                        this._mergeTranslatedObjectPairs(index, object, [repo]);
+                    }
                 }
             )
                 .catch(error => {
@@ -530,7 +547,7 @@ export default class Finder {
                 });
         };
 
-        const index = new Map();
+        const index = onPair ? null : new Map();
         const arinExtra = this.whoisParsers.arin && arinTypes.length > 0
             ? this.whoisParsers.arin.forEachObject(
                 arinTypes,
@@ -544,7 +561,12 @@ export default class Finder {
                     "Updated"
                 ],
                 (object) => {
-                    this._mergeTranslatedObjectPairs(index, this._normalizeArinNetRangeObject(object), ["arin"]);
+                    const normalizedObject = this._normalizeArinNetRangeObject(object);
+                    if (onPair) {
+                        this._visitTranslatedObjectPairs(normalizedObject, ["arin"], onPair);
+                    } else {
+                        this._mergeTranslatedObjectPairs(index, normalizedObject, ["arin"]);
+                    }
                 }
             )
                 .catch(error => {
@@ -557,7 +579,7 @@ export default class Finder {
             ...this.connectors.map(loadBulkRecordsForRepo),
             arinExtra
         ])
-            .then(() => [...index.values()]);
+            .then(() => onPair ? null : [...index.values()]);
     };
 
     _parseDirectoryNamesFromIndex = (html = "") => {
@@ -856,7 +878,11 @@ export default class Finder {
     getGeofeedsFiles = (blocks) => {
         const out = [];
         const customGeofeeds = this._getCustomGeofeedUrls();
-        const whoisAndCustomUrls = [...new Set([...blocks.map(i => i.geofeed), ...customGeofeeds].filter(Boolean))];
+        const isDiscoveryOnly = !Array.isArray(blocks);
+        const whoisUrls = isDiscoveryOnly
+            ? (blocks?.whoisUrls ?? [])
+            : blocks.map(i => i.geofeed);
+        const whoisAndCustomUrls = [...new Set([...whoisUrls, ...customGeofeeds].filter(Boolean))];
 
         return this._getCaidaGeofeedUrls()
             .then(caidaUrls => {
@@ -870,7 +896,12 @@ export default class Finder {
                     .filter(url => caidaAdditionalSet.has(url))
                     .filter(url => !this._isCachedGeofeedValid(this._getFileName(url)))
                     .length;
-                const discoveredUrls = this._buildDiscoveredGeofeedUrlRecords(blocks, customGeofeeds, caidaUrls);
+                const discoveredUrls = this._buildDiscoveredGeofeedUrlRecords({
+                    blocks: isDiscoveryOnly ? [] : blocks,
+                    discoveredUrlRecords: isDiscoveryOnly ? (blocks?.discoveredUrlRecords ?? []) : [],
+                    customGeofeeds,
+                    caidaUrls
+                });
 
                 this.discoveryStats.caidaAdditionalUrls = caidaAdditionalUrls.length;
                 this.discoveryStats.caidaDownloadCandidates = caidaDownloadCandidates;
@@ -1129,6 +1160,78 @@ export default class Finder {
         return new Set((pairs ?? []).map(item => item?.geofeed).filter(Boolean)).size;
     };
 
+    _getDownloadOnlyWhoisDiscovery = () => {
+        const bulkPairKeys = new Set();
+        const livePairKeys = new Set();
+        const bulkGeofeeds = new Set();
+        const liveGeofeeds = new Set();
+        const allWhoisGeofeeds = new Set();
+        const discoveredUrlIndex = new Map();
+        const bulkPrefixes = new Set();
+        const bulkPrefixMatcher = new LongestPrefixMatch();
+
+        const addBulkPair = (pair) => {
+            const key = `${pair?.inetnum}|${pair?.geofeed}`;
+            if (!pair?.inetnum || !pair?.geofeed) {
+                return;
+            }
+
+            this._mergeDiscoveredGeofeedUrl(discoveredUrlIndex, pair.geofeed, pair.discoverySources);
+            if (bulkPairKeys.has(key)) {
+                return;
+            }
+
+            bulkPairKeys.add(key);
+            bulkGeofeeds.add(pair.geofeed);
+            allWhoisGeofeeds.add(pair.geofeed);
+
+            if (ipUtils.isValidPrefix(pair.inetnum) && !bulkPrefixes.has(pair.inetnum)) {
+                bulkPrefixes.add(pair.inetnum);
+                bulkPrefixMatcher.addPrefix(pair.inetnum, pair.inetnum);
+            }
+        };
+
+        const addLivePair = (pair) => {
+            const key = `${pair?.inetnum}|${pair?.geofeed}`;
+            if (!pair?.inetnum || !pair?.geofeed) {
+                return;
+            }
+
+            this._mergeDiscoveredGeofeedUrl(discoveredUrlIndex, pair.geofeed, pair.discoverySources);
+            if (livePairKeys.has(key)) {
+                return;
+            }
+
+            livePairKeys.add(key);
+            liveGeofeeds.add(pair.geofeed);
+            allWhoisGeofeeds.add(pair.geofeed);
+        };
+
+        return this._getBulkGeofeedInetnumPairs(addBulkPair)
+            .then(() => this._getLiveReferralGeofeedPairs({
+                bulkPrefixMatcher,
+                onPair: addLivePair
+            }))
+            .then(() => {
+                this.discoveryStats = {
+                    ...this.discoveryStats,
+                    bulkPairs: bulkPairKeys.size,
+                    livePairs: livePairKeys.size,
+                    bulkUniqueGeofeeds: bulkGeofeeds.size,
+                    liveUniqueGeofeeds: liveGeofeeds.size,
+                    totalUniqueGeofeeds: allWhoisGeofeeds.size
+                };
+
+                return {
+                    whoisUrls: [...discoveredUrlIndex.keys()],
+                    discoveredUrlRecords: [...discoveredUrlIndex.entries()].map(([url, sources]) => ({
+                        url,
+                        sources: [...sources].sort()
+                    }))
+                };
+            });
+    };
+
     _ipv4ToBigInt = (ip) => {
         const parts = `${ip ?? ""}`.trim().split(".").map(i => parseInt(i));
         if (parts.length !== 4 || parts.some(i => !Number.isInteger(i) || i < 0 || i > 255)) {
@@ -1323,15 +1426,24 @@ export default class Finder {
             });
     };
 
-    _getLiveReferralGeofeedPairs = (bulkPairs = []) => {
+    _getLiveReferralGeofeedPairs = (options = {}) => {
         if (!this.params.arinLiveReferrals) {
             return Promise.resolve([]);
         }
 
-        const lpm = new LongestPrefixMatch();
-        for (let pair of bulkPairs ?? []) {
-            if (pair?.geofeed && ipUtils.isValidPrefix(pair?.inetnum)) {
-                lpm.addPrefix(pair.inetnum, pair.inetnum);
+        const {
+            bulkPairs = [],
+            bulkPrefixMatcher = null,
+            onPair = null
+        } = Array.isArray(options)
+            ? {bulkPairs: options}
+            : (options ?? {});
+        const lpm = bulkPrefixMatcher || new LongestPrefixMatch();
+        if (!bulkPrefixMatcher) {
+            for (let pair of bulkPairs ?? []) {
+                if (pair?.geofeed && ipUtils.isValidPrefix(pair?.inetnum)) {
+                    lpm.addPrefix(pair.inetnum, pair.inetnum);
+                }
             }
         }
 
@@ -1351,7 +1463,6 @@ export default class Finder {
                 const toProbe = maxProbes > 0
                     ? sortedUncovered.slice(0, maxProbes)
                     : sortedUncovered;
-                const out = [];
 
                 this._logReferral(`[referral][live] candidates=${candidates.length} uncovered=${uncovered.length} probing=${toProbe.length} max_probes=${maxProbes > 0 ? maxProbes : "unlimited"}`);
                 if (maxProbes > 0 && uncovered.length > maxProbes) {
@@ -1359,10 +1470,11 @@ export default class Finder {
                 }
 
                 if (!toProbe.length) {
-                    return [];
+                    return onPair ? null : [];
                 }
 
                 const concurrency = Math.max(parseInt(this.params.referralConcurrency || 10), 1);
+                const out = onPair ? null : [];
 
                 return batchPromises(concurrency, toProbe, async candidate => {
                     const query = candidate.query;
@@ -1382,12 +1494,18 @@ export default class Finder {
                             });
 
                             for (let geofeed of geofeeds) {
-                                out.push({
+                                const pair = {
                                     inetnum: candidate.inetnum,
                                     geofeed,
                                     lastUpdate: candidate.lastUpdate,
                                     discoverySources: [candidate.rir]
-                                });
+                                };
+
+                                if (onPair) {
+                                    onPair(pair);
+                                } else {
+                                    out.push(pair);
+                                }
                             }
                         } else {
                             this._logReferral(`[referral][live] rir=${candidate.rir} query="${query}" inetnum="${candidate.inetnum}" source="${target.host}:${target.port}" geofeeds=none`);
@@ -1554,6 +1672,10 @@ export default class Finder {
                     });
 
             } else {
+                if (this.params.disableProcessing && !this.params.test) {
+                    return this._getDownloadOnlyWhoisDiscovery();
+                }
+
                 return this._getBulkGeofeedInetnumPairs()
                     .then((bulkPairs = []) => this._getLiveReferralGeofeedPairs(bulkPairs)
                         .then((liveReferralPairs) => {
