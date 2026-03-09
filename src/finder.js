@@ -77,7 +77,7 @@ export default class Finder {
         this.connectors = this.whoisRepos.filter(key => this.params.include.includes(key));
         this._caidaGeofeedUrlsPromise = null;
         this._geofeedUrlStorePromise = null;
-        this._insecureHttpDispatcher = null;
+        this._requestHttpDispatcher = null;
 
         this.whoisParsers = {};
         for (let repo of this.connectors) {
@@ -122,14 +122,11 @@ export default class Finder {
     };
 
     _getRequestFetch = (signal = null) => {
-        if (!this.params.insecure && !signal) {
-            return fetch;
-        }
-
-        if (this.params.insecure && !this._insecureHttpDispatcher) {
-            this._insecureHttpDispatcher = new Agent({
+        if (!this._requestHttpDispatcher) {
+            this._requestHttpDispatcher = new Agent({
                 connect: {
-                    rejectUnauthorized: false
+                    family: 4,
+                    ...(this.params.insecure ? {rejectUnauthorized: false} : {})
                 }
             });
         }
@@ -142,22 +139,22 @@ export default class Finder {
             return fetch(url, {
                 ...options,
                 ...(mergedSignal ? {signal: mergedSignal} : {}),
-                ...(this.params.insecure ? {dispatcher: this._insecureHttpDispatcher} : {})
+                dispatcher: this._requestHttpDispatcher
             });
         };
     };
 
     _closeRequestFetch = async () => {
-        if (!this._insecureHttpDispatcher) {
+        if (!this._requestHttpDispatcher) {
             return;
         }
 
         try {
-            await this._insecureHttpDispatcher.close();
+            await this._requestHttpDispatcher.close();
         } catch (error) {
-            this.logger?.log?.(`Error: insecure HTTP dispatcher shutdown (${error?.message ?? "Unknown error"})`);
+            this.logger?.log?.(`Error: HTTP dispatcher shutdown (${error?.message ?? "Unknown error"})`);
         } finally {
-            this._insecureHttpDispatcher = null;
+            this._requestHttpDispatcher = null;
         }
     };
 
