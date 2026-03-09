@@ -11,6 +11,7 @@ import ipUtils from "ip-sub";
 import {explicitTransferCheck, lessSpecific} from "whois-wrapper";
 import {execFile} from "child_process";
 import {inspect} from "util";
+import readline from "readline";
 import {Readable, Transform} from "stream";
 import {pipeline} from "stream/promises";
 import {Agent} from "undici";
@@ -410,6 +411,221 @@ export default class Finder {
 
     _isRequestTimeoutError = (error) => {
         return !!error?.isTimeout || error?.code === "ETIMEDOUT" || error?.name === "TimeoutError";
+    };
+
+    _fetchResponseWithTimeout = async (url, options = {}, timeoutMs = 0) => {
+        const controller = new AbortController();
+        const requestFetch = this._getRequestFetch(controller.signal);
+        let didTimeout = false;
+        const timeoutId = timeoutMs > 0
+            ? setTimeout(() => {
+                didTimeout = true;
+                const reason = new Error(`Request timeout after ${timeoutMs}ms`);
+                reason.name = "TimeoutError";
+                reason.code = "ETIMEDOUT";
+                controller.abort(reason);
+            }, timeoutMs)
+            : null;
+
+        try {
+            const response = await requestFetch(url, options);
+            if (!response.ok) {
+                const error = new Error(`Request failed with status code ${response.status}`);
+                error.response = {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: Object.fromEntries(response.headers?.entries?.() ?? [])
+                };
+                throw error;
+            }
+
+            return response;
+        } catch (rawError) {
+            const error = rawError instanceof Error
+                ? rawError
+                : Object.assign(new Error(rawError?.message ?? "Request failed"), rawError ?? {});
+
+            if (didTimeout) {
+                error.name = "TimeoutError";
+                error.code = "ETIMEDOUT";
+                error.isTimeout = true;
+                error.message = `Request timeout after ${timeoutMs}ms`;
+            }
+
+            throw error;
+        } finally {
+            if (timeoutId) {
+                clearTimeout(timeoutId);
+            }
+        }
+    };
+
+    _downloadFetchResponseToFile = async (url, targetFile, timeoutMs = 0) => {
+        const temporaryFile = `${targetFile}.tmp`;
+
+        if (fs.existsSync(temporaryFile)) {
+            fs.unlinkSync(temporaryFile);
+        }
+
+        try {
+            const response = await this._fetchResponseWithTimeout(url, {
+                method: "GET"
+            }, timeoutMs);
+
+            await pipeline(
+                Readable.fromWeb(response.body),
+                fs.createWriteStream(temporaryFile, {flags: "w"})
+            );
+
+            fs.renameSync(temporaryFile, targetFile);
+        } catch (error) {
+            if (fs.existsSync(temporaryFile)) {
+                fs.unlinkSync(temporaryFile);
+            }
+
+            throw error;
+        }
+    };
+
+    _parseDelegatedDateValue = (date) => {
+        const match = `${date ?? ""}`.trim().match(/^(\d{4})(\d{2})(\d{2})$/);
+        if (!match) {
+            return 0;
+        }
+
+        const [, year, month, day] = match;
+        return Date.UTC(parseInt(year), parseInt(month) - 1, parseInt(day));
+    };
+
+    _compareLiveReferralCandidates = (left, right) => {
+        const leftDate = left?.lastUpdateTs ?? 0;
+        const rightDate = right?.lastUpdateTs ?? 0;
+        if (leftDate !== rightDate) {
+            return leftDate - rightDate;
+        }
+
+        const leftKey = left?.key ?? "";
+        const rightKey = right?.key ?? "";
+        return leftKey.localeCompare(rightKey);
+    };
+
+    _liveReferralHeapSwap = (heap, leftIndex, rightIndex) => {
+        const temporary = heap[leftIndex];
+        heap[leftIndex] = heap[rightIndex];
+        heap[rightIndex] = temporary;
+    };
+
+    _liveReferralHeapSiftUp = (heap, startIndex) => {
+        let index = startIndex;
+        while (index > 0) {
+            const parentIndex = Math.floor((index - 1) / 2);
+            if (this._compareLiveReferralCandidates(heap[index], heap[parentIndex]) >= 0) {
+                break;
+            }
+
+            this._liveReferralHeapSwap(heap, index, parentIndex);
+            index = parentIndex;
+        }
+    };
+
+    _liveReferralHeapSiftDown = (heap, startIndex) => {
+        let index = startIndex;
+        while (true) {
+            const leftChild = index * 2 + 1;
+            const rightChild = leftChild + 1;
+            let smallest = index;
+
+            if (leftChild < heap.length && this._compareLiveReferralCandidates(heap[leftChild], heap[smallest]) < 0) {
+                smallest = leftChild;
+            }
+
+            if (rightChild < heap.length && this._compareLiveReferralCandidates(heap[rightChild], heap[smallest]) < 0) {
+                smallest = rightChild;
+            }
+
+            if (smallest === index) {
+                return;
+            }
+
+            this._liveReferralHeapSwap(heap, index, smallest);
+            index = smallest;
+        }
+    };
+
+    _liveReferralHeapPush = (heap, candidate) => {
+        heap.push(candidate);
+        this._liveReferralHeapSiftUp(heap, heap.length - 1);
+    };
+
+    _liveReferralHeapPop = (heap) => {
+        if (!heap.length) {
+            return null;
+        }
+
+        const first = heap[0];
+        const last = heap.pop();
+        if (heap.length && last) {
+            heap[0] = last;
+            this._liveReferralHeapSiftDown(heap, 0);
+        }
+
+        return first;
+    };
+
+    _pruneLiveReferralHeap = (heap, selected) => {
+        while (heap.length > 0 && selected.get(heap[0].key) !== heap[0]) {
+            this._liveReferralHeapPop(heap);
+        }
+    };
+
+    _createLiveReferralCandidateCollector = (maxCandidates = 0) => {
+        const selected = new Map();
+        const heap = maxCandidates > 0 ? [] : null;
+
+        const add = (candidate) => {
+            const existing = selected.get(candidate.key);
+            if (existing) {
+                if (this._compareLiveReferralCandidates(candidate, existing) <= 0) {
+                    return;
+                }
+
+                selected.set(candidate.key, candidate);
+                if (heap) {
+                    this._liveReferralHeapPush(heap, candidate);
+                }
+                return;
+            }
+
+            if (!heap || selected.size < maxCandidates) {
+                selected.set(candidate.key, candidate);
+                if (heap) {
+                    this._liveReferralHeapPush(heap, candidate);
+                }
+                return;
+            }
+
+            this._pruneLiveReferralHeap(heap, selected);
+            const worst = heap[0];
+            if (!worst || this._compareLiveReferralCandidates(candidate, worst) <= 0) {
+                return;
+            }
+
+            selected.delete(worst.key);
+            this._liveReferralHeapPop(heap);
+            selected.set(candidate.key, candidate);
+            this._liveReferralHeapPush(heap, candidate);
+        };
+
+        const values = () => {
+            return [...selected.values()]
+                .sort((left, right) => this._compareLiveReferralCandidates(right, left));
+        };
+
+        return {
+            add,
+            values,
+            size: () => selected.size
+        };
     };
 
     _buildDiscoveredGeofeedUrlRecords = ({
@@ -1441,9 +1657,92 @@ export default class Finder {
         }
     };
 
-    _getLiveDelegatedProbeCandidates = () => {
+    _forEachDelegatedCandidateInFile = async ({repo, config, file, onCandidate}) => {
+        const seen = new Set();
+        const input = fs.createReadStream(file, {encoding: "utf8"});
+        const lines = readline.createInterface({
+            input,
+            crlfDelay: Infinity
+        });
+        let candidateCount = 0;
+
+        try {
+            for await (let rawLine of lines) {
+                const line = `${rawLine ?? ""}`.trim();
+                if (!line || line.startsWith("#")) {
+                    continue;
+                }
+
+                const [rir, cc, type, start, value, date, status] = line.split("|");
+                if (!config.rirIds.includes(`${rir ?? ""}`.toLowerCase())) {
+                    continue;
+                }
+
+                if (!["allocated", "assigned"].includes(`${status ?? ""}`.toLowerCase())) {
+                    continue;
+                }
+
+                const lastUpdateTs = this._parseDelegatedDateValue(date);
+                if (type === "ipv4" && this.params.af.includes(4)) {
+                    const prefixes = this._ipv4RangeToCidrs(start, value);
+                    for (let inetnum of prefixes) {
+                        const key = `${repo}|${inetnum}`;
+                        if (seen.has(key)) {
+                            continue;
+                        }
+
+                        seen.add(key);
+                        candidateCount++;
+                        onCandidate?.({
+                            key,
+                            rir: repo,
+                            inetnum,
+                            query: ipUtils.getIpAndCidr(inetnum)[0],
+                            host: config.whoisHost,
+                            port: 43,
+                            lastUpdateTs
+                        });
+                    }
+                } else if (type === "ipv6" && this.params.af.includes(6)) {
+                    const bits = parseInt(value);
+                    if (!Number.isInteger(bits) || bits < 0 || bits > 128) {
+                        continue;
+                    }
+
+                    const inetnum = ipUtils.toPrefix(`${start}/${bits}`);
+                    const key = `${repo}|${inetnum}`;
+                    if (seen.has(key)) {
+                        continue;
+                    }
+
+                    seen.add(key);
+                    candidateCount++;
+                    onCandidate?.({
+                        key,
+                        rir: repo,
+                        inetnum,
+                        query: inetnum.split("/")[0],
+                        host: config.whoisHost,
+                        port: 43,
+                        lastUpdateTs
+                    });
+                }
+            }
+        } finally {
+            lines.close();
+            input.destroy();
+        }
+
+        return candidateCount;
+    };
+
+    _getLiveDelegatedProbeCandidates = (bulkPrefixMatcher = null) => {
         if (!this.params.arinLiveReferrals) {
-            return Promise.resolve([]);
+            return Promise.resolve({
+                candidates: [],
+                totalCandidates: 0,
+                uncoveredCount: 0
+            });
         }
 
         const rirConfigs = {
@@ -1476,121 +1775,79 @@ export default class Finder {
 
         const repos = this.params.include.filter(repo => !!rirConfigs[repo]);
         if (!repos.length) {
-            return Promise.resolve([]);
+            return Promise.resolve({
+                candidates: [],
+                totalCandidates: 0,
+                uncoveredCount: 0
+            });
         }
 
         const cacheDays = Math.max(parseInt(this.params.whoisCacheDays || 3), 1);
+        const maxProbes = Math.max(parseInt(this.params.liveReferralMaxProbes || 0), 0);
+        const lpm = bulkPrefixMatcher || new LongestPrefixMatch();
+        const collector = this._createLiveReferralCandidateCollector(maxProbes);
+        let totalCandidates = 0;
+        let uncoveredCount = 0;
+
         this._logReferral(`[referral][live] enabled repos=${repos.join(",")}`);
 
-        const loadRepoCandidates = (repo) => {
+        const loadRepoCandidates = async (repo) => {
             const config = rirConfigs[repo];
             const cacheFile = `${this.cacheDir}live-referrals-delegated-${repo}`;
             const isCacheFresh = fs.existsSync(cacheFile) &&
                 moment().diff(moment(fs.statSync(cacheFile).ctime), "days") <= cacheDays;
 
-            const parse = (content = "") => {
-                const out = [];
+            const parseFile = async (source) => {
+                let repoCandidates = 0;
+                let repoUncovered = 0;
 
-                for (let line of content.split(/\r?\n/)) {
-                    if (!line || line.startsWith("#")) {
-                        continue;
-                    }
+                await this._forEachDelegatedCandidateInFile({
+                    repo,
+                    config,
+                    file: cacheFile,
+                    onCandidate: (candidate) => {
+                        repoCandidates++;
+                        totalCandidates++;
 
-                    const [rir, cc, type, start, value, date, status] = line.split("|");
-                    if (!config.rirIds.includes(`${rir ?? ""}`.toLowerCase())) {
-                        continue;
-                    }
-
-                    if (!["allocated", "assigned"].includes(`${status ?? ""}`.toLowerCase())) {
-                        continue;
-                    }
-
-                    if (type === "ipv4" && this.params.af.includes(4)) {
-                        const prefixes = this._ipv4RangeToCidrs(start, value);
-                        const lastUpdate = moment(date, "YYYYMMDD", true);
-
-                        for (let inetnum of prefixes) {
-                            const query = ipUtils.getIpAndCidr(inetnum)[0];
-                            out.push({
-                                rir: repo,
-                                inetnum,
-                                query,
-                                target: {
-                                    protocol: "whois",
-                                    host: config.whoisHost,
-                                    port: 43
-                                },
-                                lastUpdate: lastUpdate.isValid() ? lastUpdate : moment(0)
-                            });
-                        }
-                    } else if (type === "ipv6" && this.params.af.includes(6)) {
-                        const bits = parseInt(value);
-                        if (!Number.isInteger(bits) || bits < 0 || bits > 128) {
-                            continue;
+                        if (!ipUtils.isValidPrefix(candidate?.inetnum)) {
+                            return;
                         }
 
-                        const inetnum = ipUtils.toPrefix(`${start}/${bits}`);
-                        const query = inetnum.split("/")[0];
-                        const lastUpdate = moment(date, "YYYYMMDD", true);
-                        out.push({
-                            rir: repo,
-                            inetnum,
-                            query,
-                            target: {
-                                protocol: "whois",
-                                host: config.whoisHost,
-                                port: 43
-                            },
-                            lastUpdate: lastUpdate.isValid() ? lastUpdate : moment(0)
-                        });
+                        if (lpm.getMatch(candidate.inetnum, false).length > 0) {
+                            return;
+                        }
+
+                        repoUncovered++;
+                        uncoveredCount++;
+                        collector.add(candidate);
                     }
-                }
+                });
 
-                const index = {};
-                for (let candidate of out) {
-                    index[`${candidate.rir}|${candidate.inetnum}`] = candidate;
-                }
-
-                return Object.values(index);
+                this._logReferral(`[referral][live] repo=${repo} source=${source} candidates=${repoCandidates} uncovered=${repoUncovered}`);
             };
 
             if (isCacheFresh) {
-                const candidates = parse(fs.readFileSync(cacheFile, "utf8"));
-                this._logReferral(`[referral][live] repo=${repo} source=cache candidates=${candidates.length}`);
-                return Promise.resolve(candidates);
+                await parseFile("cache");
+                return;
             }
 
-            return this._axiosRequest({
-                url: config.delegatedUrl,
-                method: "GET",
-                timeout: 20000
-            })
-                .then(response => {
-                    fs.writeFileSync(cacheFile, response.data);
-                    const candidates = parse(response.data);
-                    this._logReferral(`[referral][live] repo=${repo} source=download candidates=${candidates.length}`);
-                    return candidates;
-                })
-                .catch(error => {
-                    this._logReferral(`Error: ${repo} delegated stats (${error?.message ?? "Unknown error"})`);
-                    if (fs.existsSync(cacheFile)) {
-                        const candidates = parse(fs.readFileSync(cacheFile, "utf8"));
-                        this._logReferral(`[referral][live] repo=${repo} source=stale-cache candidates=${candidates.length}`);
-                        return candidates;
-                    }
-                    return [];
-                });
+            try {
+                await this._downloadFetchResponseToFile(config.delegatedUrl, cacheFile, 20000);
+                await parseFile("download");
+            } catch (error) {
+                this._logReferral(`Error: ${repo} delegated stats (${error?.message ?? "Unknown error"})`);
+                if (fs.existsSync(cacheFile)) {
+                    await parseFile("stale-cache");
+                }
+            }
         };
 
-        return Promise.all(repos.map(loadRepoCandidates))
-            .then(results => {
-                const candidates = results.flat();
-                const index = {};
-                for (let candidate of candidates) {
-                    index[`${candidate.rir}|${candidate.inetnum}`] = candidate;
-                }
-                return Object.values(index);
-            });
+        return batchPromises(1, repos, loadRepoCandidates)
+            .then(() => ({
+                candidates: collector.values(),
+                totalCandidates,
+                uncoveredCount
+            }));
     };
 
     _getLiveReferralGeofeedPairs = (options = {}) => {
@@ -1614,26 +1871,14 @@ export default class Finder {
             }
         }
 
-        return this._getLiveDelegatedProbeCandidates()
-            .then(candidates => {
-                const uncovered = candidates.filter(candidate => {
-                    if (!ipUtils.isValidPrefix(candidate?.inetnum)) {
-                        return false;
-                    }
-
-                    return lpm.getMatch(candidate.inetnum, false).length === 0;
-                });
-
+        return this._getLiveDelegatedProbeCandidates(lpm)
+            .then(({candidates = [], totalCandidates = 0, uncoveredCount = 0} = {}) => {
                 const maxProbes = Math.max(parseInt(this.params.liveReferralMaxProbes || 0), 0);
-                const sortedUncovered = [...uncovered]
-                    .sort((a, b) => (b?.lastUpdate?.valueOf?.() ?? 0) - (a?.lastUpdate?.valueOf?.() ?? 0));
-                const toProbe = maxProbes > 0
-                    ? sortedUncovered.slice(0, maxProbes)
-                    : sortedUncovered;
+                const toProbe = candidates;
 
-                this._logReferral(`[referral][live] candidates=${candidates.length} uncovered=${uncovered.length} probing=${toProbe.length} max_probes=${maxProbes > 0 ? maxProbes : "unlimited"}`);
-                if (maxProbes > 0 && uncovered.length > maxProbes) {
-                    this._logReferral(`[referral][live] probe-limit applied skipped=${uncovered.length - maxProbes}`);
+                this._logReferral(`[referral][live] candidates=${totalCandidates} uncovered=${uncoveredCount} probing=${toProbe.length} max_probes=${maxProbes > 0 ? maxProbes : "unlimited"}`);
+                if (maxProbes > 0 && uncoveredCount > maxProbes) {
+                    this._logReferral(`[referral][live] probe-limit applied skipped=${uncoveredCount - maxProbes}`);
                 }
 
                 if (!toProbe.length) {
@@ -1645,7 +1890,11 @@ export default class Finder {
 
                 return batchPromises(concurrency, toProbe, async candidate => {
                     const query = candidate.query;
-                    const target = candidate.target;
+                    const target = {
+                        protocol: "whois",
+                        host: candidate.host,
+                        port: candidate.port
+                    };
                     this._logReferral(`[referral][live] rir=${candidate.rir} query="${query}" inetnum="${candidate.inetnum}" source="${target.host}:${target.port}" action=probe`);
 
                     try {
@@ -1664,7 +1913,7 @@ export default class Finder {
                                 const pair = {
                                     inetnum: candidate.inetnum,
                                     geofeed,
-                                    lastUpdate: candidate.lastUpdate,
+                                    lastUpdate: candidate.lastUpdateTs,
                                     discoverySources: [candidate.rir]
                                 };
 
