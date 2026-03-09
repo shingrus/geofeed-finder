@@ -11,6 +11,8 @@ import ipUtils from "ip-sub";
 import {explicitTransferCheck, lessSpecific} from "whois-wrapper";
 import {execFile} from "child_process";
 import {inspect} from "util";
+import {Readable, Transform} from "stream";
+import {pipeline} from "stream/promises";
 import {Agent} from "undici";
 
 require("events").EventEmitter.defaultMaxListeners = 200;
@@ -118,12 +120,12 @@ export default class Finder {
         return this._cleanString(value).toLowerCase();
     };
 
-    _getRequestFetch = () => {
-        if (!this.params.insecure) {
+    _getRequestFetch = (signal = null) => {
+        if (!this.params.insecure && !signal) {
             return fetch;
         }
 
-        if (!this._insecureHttpDispatcher) {
+        if (this.params.insecure && !this._insecureHttpDispatcher) {
             this._insecureHttpDispatcher = new Agent({
                 connect: {
                     rejectUnauthorized: false
@@ -132,9 +134,14 @@ export default class Finder {
         }
 
         return (url, options = {}) => {
+            const mergedSignal = signal && options?.signal && typeof AbortSignal?.any === "function"
+                ? AbortSignal.any([signal, options.signal])
+                : (signal || options?.signal || undefined);
+
             return fetch(url, {
                 ...options,
-                dispatcher: this._insecureHttpDispatcher
+                ...(mergedSignal ? {signal: mergedSignal} : {}),
+                ...(this.params.insecure ? {dispatcher: this._insecureHttpDispatcher} : {})
             });
         };
     };
@@ -154,10 +161,55 @@ export default class Finder {
     };
 
     _axiosRequest = (config = {}) => {
+        const timeout = Number.isFinite(Number(config?.timeout))
+            ? Number(config.timeout)
+            : 0;
+        const controller = new AbortController();
+        const signal = config?.signal && typeof AbortSignal?.any === "function"
+            ? AbortSignal.any([controller.signal, config.signal])
+            : (config?.signal || controller.signal);
+        let didTimeout = false;
+        const timeoutId = timeout > 0
+            ? setTimeout(() => {
+                didTimeout = true;
+                const reason = new Error(`Request timeout after ${timeout}ms`);
+                reason.name = "TimeoutError";
+                reason.code = "ETIMEDOUT";
+                controller.abort(reason);
+            }, timeout)
+            : null;
+
+        const normalizeError = (error) => {
+            const out = error instanceof Error
+                ? error
+                : Object.assign(new Error(error?.message ?? "Request failed"), error ?? {});
+
+            out.config ??= {
+                url: config?.url,
+                method: config?.method,
+                timeout
+            };
+
+            if (didTimeout) {
+                out.name = "TimeoutError";
+                out.code = "ETIMEDOUT";
+                out.isTimeout = true;
+                out.message = `Request timeout after ${timeout}ms`;
+            }
+
+            return out;
+        };
+
         return axios({
             ...config,
-            fetch: this._getRequestFetch()
-        });
+            fetch: this._getRequestFetch(signal)
+        })
+            .catch(error => Promise.reject(normalizeError(error)))
+            .finally(() => {
+                if (timeoutId) {
+                    clearTimeout(timeoutId);
+                }
+            });
     };
 
     _mergeDiscoverySources = (...sources) => {
@@ -354,6 +406,10 @@ export default class Finder {
         }
 
         return `Error: ${url} ${status || "failed"}`;
+    };
+
+    _isRequestTimeoutError = (error) => {
+        return !!error?.isTimeout || error?.code === "ETIMEDOUT" || error?.name === "TimeoutError";
     };
 
     _buildDiscoveredGeofeedUrlRecords = ({
@@ -704,15 +760,119 @@ export default class Finder {
         return this._caidaGeofeedUrlsPromise;
     };
 
+    _getHeaderValue = (headers, name) => {
+        if (!headers || !name) {
+            return null;
+        }
+
+        if (typeof headers.get === "function") {
+            return headers.get(name);
+        }
+
+        return headers?.[name.toLowerCase()] ?? headers?.[name] ?? null;
+    };
+
     _getFileName = (file) => {
         return this.cacheDir + md5(file);
+    };
+
+    _getTemporaryDirectory = () => {
+        return `${this.cacheDir}tmp/`;
+    };
+
+    _getTemporaryFileName = (cachedFile) => {
+        const fileName = `${cachedFile ?? ""}`.split("/").pop();
+        return `${this._getTemporaryDirectory()}${fileName}.tmp`;
+    };
+
+    _looksLikeHtmlPrefix = (buffer) => {
+        if (!buffer?.length) {
+            return false;
+        }
+
+        const prefix = buffer
+            .toString("utf8")
+            .replace(/^\uFEFF/, "")
+            .trimStart()
+            .toLowerCase();
+
+        return /^(?:<!doctype\s+html\b|<html\b|<head\b|<body\b|<div\b|<span\b|<style\b|<link\b|<a\b)/i.test(prefix);
+    };
+
+    _streamResponseToFile = async (response, targetFile) => {
+        if (!response?.body) {
+            throw new Error("Error: empty response body");
+        }
+
+        const sniffLimit = 8192;
+        const finder = this;
+        let prefixBuffer = Buffer.alloc(0);
+        let decided = false;
+
+        const sniffHtmlPrefix = new Transform({
+            transform(chunk, encoding, callback) {
+                const data = Buffer.isBuffer(chunk)
+                    ? chunk
+                    : Buffer.from(chunk);
+
+                if (decided) {
+                    callback(null, data);
+                    return;
+                }
+
+                prefixBuffer = Buffer.concat([prefixBuffer, data]);
+
+                if (finder._looksLikeHtmlPrefix(prefixBuffer)) {
+                    const error = new Error("HTML instead of CSV");
+                    error.geofeedInvalid = true;
+                    error.responseData = prefixBuffer.toString("utf8");
+                    callback(error);
+                    return;
+                }
+
+                if (prefixBuffer.length >= sniffLimit) {
+                    decided = true;
+                    const out = prefixBuffer;
+                    prefixBuffer = Buffer.alloc(0);
+                    callback(null, out);
+                    return;
+                }
+
+                callback();
+            },
+            flush(callback) {
+                if (decided || prefixBuffer.length === 0) {
+                    callback();
+                    return;
+                }
+
+                if (finder._looksLikeHtmlPrefix(prefixBuffer)) {
+                    const error = new Error("HTML instead of CSV");
+                    error.geofeedInvalid = true;
+                    error.responseData = prefixBuffer.toString("utf8");
+                    callback(error);
+                    return;
+                }
+
+                this.push(prefixBuffer);
+                prefixBuffer = Buffer.alloc(0);
+                callback();
+            }
+        });
+
+        await pipeline(
+            Readable.fromWeb(response.body),
+            sniffHtmlPrefix,
+            fs.createWriteStream(targetFile, {flags: "w"})
+        );
     };
 
     _setGeofeedCacheHeaders = (response, cachedFile) => {
         let setAge = 3600 * 24 * (this.params.geofeedCacheDays || 7); // default 1 week (see draft)
 
-        if (response.headers["cache-control"]) {
-            const maxAge = response.headers["cache-control"]
+        const cacheControl = this._getHeaderValue(response?.headers, "cache-control");
+        if (cacheControl) {
+            const maxAge = cacheControl
                 .split(",")
                 .filter(h => h.includes("max-age"))
                 .map(h => h.trim())
@@ -786,92 +946,99 @@ export default class Finder {
         }
     };
 
-    _getGeofeedFile = (file) => {
-
+    _getGeofeedFile = async (file) => {
         const abortTimeout = parseInt(this.params.downloadTimeout) * 1000;
+        const cachedFile = this._getFileName(file);
+        const temporaryFile = this._getTemporaryFileName(cachedFile);
 
-        return new Promise((resolve, reject) => {
-            let settled = false;
-            const finish = (status, resultText = null) => {
-                if (settled) {
-                    return;
-                }
+        if (this._isCachedGeofeedValid(cachedFile)) {
+            this.logEntry(file, true);
+            await this._recordGeofeedFetchResultWithText(file, "cache", this._getFetchResultText({status: "cache"}));
+            return {file, status: "cache"};
+        }
 
-                settled = true;
-                clearTimeout(timeout);
-                this._recordGeofeedFetchResultWithText(file, status, resultText)
-                    .then(() => resolve({file, status}))
-                    .catch(reject);
-            };
+        if (fs.existsSync(temporaryFile)) {
+            fs.unlinkSync(temporaryFile);
+        }
 
-            const timeout = setTimeout(() => {
-                const resultText = this._getFetchResultText({
-                    status: "timeout",
-                    url: file,
-                    timeoutMs: abortTimeout
-                });
-                this.logger.log(resultText);
-                finish("timeout", resultText);
-            }, abortTimeout);
+        fs.mkdirSync(this._getTemporaryDirectory(), {recursive: true});
 
-            const cachedFile = this._getFileName(file);
+        this.logEntry(file, false);
 
-            if (this._isCachedGeofeedValid(cachedFile)) {
+        const controller = new AbortController();
+        const requestFetch = this._getRequestFetch(controller.signal);
+        let didTimeout = false;
+        const timeoutId = setTimeout(() => {
+            didTimeout = true;
+            const reason = new Error(`Request timeout after ${abortTimeout}ms`);
+            reason.name = "TimeoutError";
+            reason.code = "ETIMEDOUT";
+            controller.abort(reason);
+        }, abortTimeout);
 
-                this.logEntry(file, true);
-                finish("cache", this._getFetchResultText({status: "cache"}));
-                return;
+        try {
+            const response = await requestFetch(file, {
+                method: "GET"
+            });
 
-            } else {
-
-                if (fs.existsSync(cachedFile)) {
-                    fs.unlinkSync(cachedFile);
-                }
-
-                this.logEntry(file, false);
-
-                this._axiosRequest({
-                    url: file,
-                    method: "GET",
-                    timeout: abortTimeout
-                })
-                    .then(response => {
-                        if (settled) {
-                            return;
-                        }
-
-                        const data = response.data;
-                        if (/<a|<div|<span|<style|<link/gi.test(data)) {
-                            const message = this._getFetchResultText({
-                                status: "invalid",
-                                url: file,
-                                responseData: data
-                            });
-                            this.logger.log(message);
-                            console.log(message);
-                            finish("invalid", message);
-                        } else {
-                            fs.writeFileSync(cachedFile, data);
-                            this._setGeofeedCacheHeaders(response, cachedFile);
-
-                            finish("downloaded", this._getFetchResultText({status: "downloaded", url: file}));
-                        }
-                    })
-                    .catch(error => {
-                        if (settled) {
-                            return;
-                        }
-
-                        const resultText = this._getFetchResultText({
-                            status: "failed",
-                            error,
-                            url: file
-                        });
-                        this.logger.log(resultText);
-                        finish("failed", resultText);
-                    });
+            if (!response.ok) {
+                const error = new Error(`Request failed with status code ${response.status}`);
+                error.response = {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: Object.fromEntries(response.headers?.entries?.() ?? [])
+                };
+                throw error;
             }
-        });
+
+            await this._streamResponseToFile(response, temporaryFile);
+            fs.renameSync(temporaryFile, cachedFile);
+            this._setGeofeedCacheHeaders(response, cachedFile);
+            await this._recordGeofeedFetchResultWithText(file, "downloaded", this._getFetchResultText({status: "downloaded", url: file}));
+            return {file, status: "downloaded"};
+        } catch (rawError) {
+            const error = rawError instanceof Error
+                ? rawError
+                : Object.assign(new Error(rawError?.message ?? "Request failed"), rawError ?? {});
+
+            if (didTimeout) {
+                error.name = "TimeoutError";
+                error.code = "ETIMEDOUT";
+                error.isTimeout = true;
+                error.message = `Request timeout after ${abortTimeout}ms`;
+            }
+
+            if (fs.existsSync(temporaryFile)) {
+                fs.unlinkSync(temporaryFile);
+            }
+
+            if (error?.geofeedInvalid) {
+                const message = this._getFetchResultText({
+                    status: "invalid",
+                    url: file,
+                    responseData: error.responseData
+                });
+                this.logger.log(message);
+                console.log(message);
+                await this._recordGeofeedFetchResultWithText(file, "invalid", message);
+                return {file, status: "invalid"};
+            }
+
+            const status = this._isRequestTimeoutError(error)
+                ? "timeout"
+                : "failed";
+            const resultText = this._getFetchResultText({
+                status,
+                error: status === "failed" ? error : null,
+                url: file,
+                timeoutMs: abortTimeout
+            });
+            this.logger.log(resultText);
+            await this._recordGeofeedFetchResultWithText(file, status, resultText);
+            return {file, status};
+        } finally {
+            clearTimeout(timeoutId);
+        }
     };
 
 
